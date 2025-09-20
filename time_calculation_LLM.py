@@ -111,9 +111,9 @@ class PipelineGraphFlattener:
 
         if isinstance(obj, simulate_LLM.Node):
             if obj.name in {"transformer", "transformer_b"}:
-                entry_edge = self._expand_transformer_node(obj)
-                self._clone_cache[obj_id] = entry_edge
-                return entry_edge
+                expanded = self._expand_transformer_node(obj)
+                self._clone_cache[obj_id] = expanded
+                return expanded
 
             cloned = simulate_LLM.Node(
                 obj.name,
@@ -127,7 +127,7 @@ class PipelineGraphFlattener:
             for child in getattr(obj, "children", []):
                 child_clone = self._clone(child)
                 if child_clone is not None:
-                    cloned.add_child(child_clone)
+                    self._attach(cloned, child_clone)
             return cloned
 
         if isinstance(obj, simulate_LLM.Edge):
@@ -146,7 +146,7 @@ class PipelineGraphFlattener:
             for child in getattr(obj, "children", []):
                 child_clone = self._clone(child)
                 if child_clone is not None:
-                    cloned_edge.add_child(child_clone)
+                    self._attach(cloned_edge, child_clone)
             return cloned_edge
 
         if isinstance(obj, simulate_LLM.Data_batch):
@@ -155,7 +155,7 @@ class PipelineGraphFlattener:
             for child in getattr(obj, "children", []):
                 child_clone = self._clone(child)
                 if child_clone is not None:
-                    cloned_batch.add_child(child_clone)
+                    self._attach(cloned_batch, child_clone)
             return cloned_batch
 
         if isinstance(obj, simulate_LLM.Gradient):
@@ -165,49 +165,29 @@ class PipelineGraphFlattener:
             for child in getattr(obj, "children", []):
                 child_clone = self._clone(child)
                 if child_clone is not None:
-                    cloned_grad.add_child(child_clone)
+                    self._attach(cloned_grad, child_clone)
             return cloned_grad
 
         raise TypeError(f"Unsupported graph element type: {type(obj)!r}")
 
-    def _expand_transformer_node(self, node: simulate_LLM.Node) -> simulate_LLM.Edge:
+    def _expand_transformer_node(self, node: simulate_LLM.Node) -> Tuple[Any, ...]:
         node_id = id(node)
         if node_id in self._clone_cache:
             cached_entry = self._clone_cache[node_id]
-            if isinstance(cached_entry, simulate_LLM.Edge):
-                return cached_entry
+            if isinstance(cached_entry, (list, tuple)):
+                return tuple(cached_entry)
 
         stage_id = getattr(node, "stage_id", node.hw_id)
         micro_batch = getattr(node, "micro_batch_index", None)
         layer_index = getattr(node, "layer_index", None)
         direction = getattr(node, "direction", "forward" if node.fwd else "backward")
 
-        entry_name = f"transformer_{direction}_entry_mb{micro_batch}_l{layer_index}"
-        exit_name = f"transformer_{direction}_exit_mb{micro_batch}_l{layer_index}"
-
-        entry_edge = simulate_LLM.Edge(entry_name, self._next_op_id(), 0.0)
-        exit_node = simulate_LLM.Node(
-            exit_name,
-            self._next_op_id(),
-            self._hw_id_for_rank(stage_id, 0),
-            0.0,
-            fwd=(direction == "forward"),
-        )
-        entry_edge.stage_id = stage_id
-        exit_node.stage_id = stage_id
-        entry_edge.micro_batch_index = micro_batch
-        exit_node.micro_batch_index = micro_batch
-        entry_edge.layer_index = layer_index
-        exit_node.layer_index = layer_index
-        entry_edge.direction = direction
-        exit_node.direction = direction
-
-        self._clone_cache[node_id] = entry_edge
-
+        rank_heads: List[Any] = []
         rank_tails: List[Any] = []
 
         for tp_rank in range(self._tp_degree):
-            previous = entry_edge
+            previous: Optional[Any] = None
+            head: Optional[Any] = None
             hw_id = self._hw_id_for_rank(stage_id, tp_rank)
 
             gemm_iterable = self._gemm_entries
@@ -236,8 +216,11 @@ class PipelineGraphFlattener:
                 gemm_node.layer_index = layer_index
                 gemm_node.direction = direction
 
-                previous.add_child(gemm_node)
+                if previous is not None:
+                    previous.add_child(gemm_node)
                 previous = gemm_node
+                if head is None:
+                    head = gemm_node
 
                 for comm_key in cfg.get("comm_keys", []):
                     comm_edge = self._create_transformer_comm_edge(
@@ -252,9 +235,11 @@ class PipelineGraphFlattener:
                     previous.add_child(comm_edge)
                     previous = comm_edge
 
-            rank_tails.append(previous)
-        for tail in rank_tails:
-            tail.add_child(exit_node)
+            if head is None:
+                raise ValueError("Transformer expansion produced no GEMM nodes")
+
+            rank_heads.append(head)
+            rank_tails.append(previous or head)
 
         dp_children: List[Any] = []
         other_children: List[Any] = []
@@ -266,28 +251,24 @@ class PipelineGraphFlattener:
             else:
                 other_children.append(child)
 
-        dp_clones: List[Any] = []
+        downstream_parents: List[Any] = list(rank_tails)
+
         for child in dp_children:
             child_clone = self._clone(child)
             if child_clone is None:
                 continue
-            exit_node.add_child(child_clone)
-            dp_clones.append(child_clone)
-
-        downstream_parents: List[Any]
-        if dp_clones:
-            downstream_parents = [dp_clones[-1]]
-        else:
-            downstream_parents = [exit_node]
+            self._attach(downstream_parents, child_clone)
+            downstream_parents = [child_clone]
 
         for child in other_children:
             child_clone = self._clone(child)
             if child_clone is None:
                 continue
-            for parent in downstream_parents:
-                parent.add_child(child_clone)
+            self._attach(downstream_parents, child_clone)
 
-        return entry_edge
+        heads_tuple = tuple(rank_heads)
+        self._clone_cache[node_id] = heads_tuple
+        return heads_tuple
 
     def _create_transformer_comm_edge(
         self,
@@ -326,6 +307,22 @@ class PipelineGraphFlattener:
         ):
             if hasattr(source, attr):
                 setattr(target, attr, getattr(source, attr))
+
+    def _attach(self, parent: Any, child: Any) -> None:
+        if parent is None or child is None:
+            return
+
+        if isinstance(parent, (list, tuple)):
+            for item in parent:
+                self._attach(item, child)
+            return
+
+        if isinstance(child, (list, tuple)):
+            for item in child:
+                self._attach(parent, item)
+            return
+
+        parent.add_child(child)
 
     def _format_gemm_name(
         self,
