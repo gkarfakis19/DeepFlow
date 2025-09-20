@@ -257,8 +257,14 @@ class PipelineGraphFlattener:
             child_clone = self._clone(child)
             if child_clone is None:
                 continue
-            self._attach(downstream_parents, child_clone)
-            downstream_parents = [child_clone]
+            exit_node.add_child(child_clone)
+            dp_clones.append(child_clone)
+
+        downstream_parents: List[Any] = [exit_node]
+        if dp_clones:
+            tail = dp_clones[-1]
+            if tail is not None and tail is not exit_node:
+                downstream_parents.append(tail)
 
         for child in other_children:
             child_clone = self._clone(child)
@@ -1455,12 +1461,12 @@ class LLMExecutionDispatcher:
 
         output_dir = "./astra_flattened_graph"
         os.makedirs(output_dir, exist_ok=True)
-        base_path = os.path.join(output_dir, "pipeline_unflattened")
-        dot = visualize_graph(self.pipeline_root, filename=base_path)
-        try:
-            dot.render(base_path, format="png", cleanup=True)
-        except Exception as exc:
-            print(f"[WARN] Failed to render pipeline graph: {exc}")
+        # base_path = os.path.join(output_dir, "pipeline_unflattened")
+        # dot = visualize_graph(self.pipeline_root, filename=base_path)
+        # try:
+        #     dot.render(base_path, format="png", cleanup=True)
+        # except Exception as exc:
+        #     print(f"[WARN] Failed to render pipeline graph: {exc}")
 
         flattener = PipelineGraphFlattener(
             pipeline_graph=self.pipeline_graph,
@@ -1470,31 +1476,24 @@ class LLMExecutionDispatcher:
         if flattened_root is None:
             raise RuntimeError("Pipeline flattening produced an empty graph")
 
-        timed_root = self.pipeline_graph.convert_comm_sizes_to_times(
-            flattened_root,
-            self.time_calc.network_model,
-            self.interconnect_params,
-        )
-
-        self.flattened_root = timed_root
-        setattr(self.time_calc, "flattened_pipeline_root", timed_root)
-        self.pipeline_root = timed_root
+        setattr(self.time_calc, "flattened_pipeline_root", flattened_root)
+        self.pipeline_root = flattened_root
 
         output_dir = "./astra_flattened_graph"
         os.makedirs(output_dir, exist_ok=True)
-        base_path = os.path.join(output_dir, "pipeline_flattened")
-        dot = visualize_graph(timed_root, filename=base_path)
-        try:
-            dot.render(base_path, format="png", cleanup=True)
-        except Exception as exc:  # pragma: no cover - visualization best-effort
-            print(f"[WARN] Failed to render flattened pipeline graph: {exc}")
+        # base_path = os.path.join(output_dir, "pipeline_flattened")
+        # dot = visualize_graph(flattened_root, filename=base_path)
+        # try:
+        #     dot.render(base_path, format="png", cleanup=True)
+        # except Exception as exc:  # pragma: no cover - visualization best-effort
+        #     print(f"[WARN] Failed to render flattened pipeline graph: {exc}")
 
-        unique_hw_ids = self._collect_hw_ids(timed_root)
+        unique_hw_ids = self._collect_hw_ids(flattened_root)
         if not unique_hw_ids:
             raise RuntimeError("Flattened pipeline graph exposes no compute nodes with hardware IDs")
 
         per_rank_sec, max_sec = run_astra_simulation_only_onepath(
-            timed_root,
+            flattened_root,
             self.time_calc,
             "./astra_pipeline_output_flat",
         )
@@ -1520,7 +1519,7 @@ class LLMExecutionDispatcher:
 
         return ExecutionResult(
             total_time=max_sec,
-            graph_root=timed_root,
+            graph_root=flattened_root,
             mode=ExecutionMode.FULL_ASTRASIM_FLATTENED,
         )
 
