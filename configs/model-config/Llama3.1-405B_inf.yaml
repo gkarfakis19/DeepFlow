@@ -1,0 +1,19 @@
+model_param:
+  mode: "LLM"
+  run_type: "inference"
+  batch_size: 1
+  seq_len: 2048
+  decode_len: 1024
+  hidden_dim: 16384
+  attention:
+    attention_type: "gqa"  # one of "mha","gqa","mla"
+    num_heads: 128
+    kv_heads: 8
+  ffn_dim: 53248
+  ffn_mult: null
+  vocab_size: 128256
+  num_layers: 126
+  n_tokens: null
+  all_reduce: "every layer"
+inference_param:
+  sample_every: -1

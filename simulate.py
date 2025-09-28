@@ -271,23 +271,6 @@ class Graph:
     counter = counter + 1
     GPU_list[gid] = False
 
-
-    #print("Start simulation...")
-    #print("root: {}.{}".format(root.name, root.op_id))
-    #for i in GPU_list:
-    #    if i:
-    #        print "_",
-    #    else:
-    #        print "A",
-    #    print " ",
-    #print " | ",
-    #for i in link_list:
-    #    if i:
-    #        print "_",
-    #    else:
-    #        print "A",
-    #print
-
     while len(event_queue) > 0:
         time, _, event = heappop(event_queue)
         event.done = True
@@ -351,22 +334,6 @@ class Graph:
               counter = counter + 1
               link_list[event.hw_id] = False
               ready_list.remove(event)
-          #if not enqueued:
-          #  print "can't schedule: " + event.name + " " + str(event.op_id)
-
-          #for i in GPU_list:
-          #    if i:
-          #        print "_",
-          #    else:
-          #        print "A",
-          #    print " ",
-          #print " | ",
-          #for i in link_list:
-          #    if i:
-          #        print "_",
-          #    else:
-          #        print "A",
-          #print
     return time
 
 
@@ -384,10 +351,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-

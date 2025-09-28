@@ -1,0 +1,21 @@
+model_param:
+  mode: "LLM"
+  run_type: "inference"
+  batch_size: 16
+  seq_len: 2048        # 32768 prefill + 1024 decode
+  decode_len: 1024
+  # prefill len = seq_len - decode_len
+  hidden_dim: 4096
+  attention:
+    attention_type: "mha"  # one of "mha","gqa","mla"
+    num_heads: 32
+    # kv_heads: 8  # set only when attention_type is "gqa"
+  ffn_dim: 11008
+  ffn_mult: null
+  vocab_size: 32000
+  num_layers: 32
+  n_tokens: null
+  all_reduce: "every layer"
+inference_param:
+  sample_every: -1
+# No GQA; KV heads = 32. FlashDecoding++ BS=1, input=32K reference.

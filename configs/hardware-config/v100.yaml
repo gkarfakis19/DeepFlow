@@ -2,7 +2,8 @@
 
 sw_param:
     kernel_launch_overhead: 9e-6 #9us
-    precision: 2 
+    precision: 2
+    h2d_bandwidth: 13297674240  # Bytes/s; set -1 to disable H2D timing 
 
 tech_param:
     core:
@@ -145,7 +146,12 @@ memory_hierarchy:
 scheduling_param:
     auto: False 
     dp: 1
-    lp: 1
+    lp: 1 # pipeline stages 
+    mb: 1 # number of micro-batches
+    t: "CR"
+    kp1: 1
+    kp2: 1
+    # LSTM LEGACY PARAMS
     kp_hidden_dim1: 1
     kp_hidden_dim2: 1
     kp_softmax_dim1: 1
@@ -158,3 +164,25 @@ scheduling_param:
     kp_softmax_type: -1
     kp_embedding_type: -1
     kp_projection_type: -1
+
+execution_backend:
+  model: astra # analytical | astra
+  astra:
+    backend: astra
+    mode: hybrid  # hybrid | full_astrasim_hierarchical | full_astrasim_flattened
+    collectives:
+      # Allowed values per op: auto | ring | direct | halvingDoubling | doubleBinaryTree
+      # Note: if topology is 'switch' and value is 'auto', we default to 'halvingDoubling'.
+      all_gather: auto
+      all_reduce: auto
+      reduce_scatter: auto
+      all_to_all: auto
+    sys_options:
+      endpoint_delay: 10
+      active_chunks_per_dimension: 32 # Higher value means significantly slower astrasim runtime, but more accurate especially for tensor parallelism
+      preferred_dataset_splits: 32 # Should be same as active_chunks_per_dimension
+
+inference:
+  kvcache_precision: 2  # bytes per element
+  kvcache_type: "hbm_only"
+  kvcache_fetch_overlap: false

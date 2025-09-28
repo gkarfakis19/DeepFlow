@@ -1,7 +1,10 @@
+# EXAMPLE FILE USED FOR TESTING/README ONLY.
+# DO NOT MODIFY!!!
+
 sw_param:
   kernel_launch_overhead: 9e-6
   precision: 2
-  h2d_bandwidth: -1  # Bytes/s; set -1 to disable H2D timing
+  h2d_bandwidth: 13297674240  # Bytes/s; set -1 to disable H2D timing
 tech_param:
   core:
     operating_frequency: 1.41e9
@@ -16,7 +19,7 @@ tech_param:
     FMA_d1: 8
     FMA_d2: 4
     dataflow: best
-    util: 1.0
+    util: 0.75
   DRAM:
     size: 80 GB
     bandwidth: 1986 GB
@@ -119,7 +122,7 @@ perimeter_breakdown:
   intra_node: 0.33
   inter_node: 0.33
 system_hierarchy:
-  num_devices_per_node: 32
+  num_devices_per_node: 8
   num_nodes: 1
   inter_derate: 1
   intra_derate: 1
@@ -129,8 +132,8 @@ system_hierarchy:
   lp_inter: false
 network_topology:
   # Allowed values: ring | fc | switch
-  inter_node: ring
-  intra_node: ring
+  inter_node: fc
+  intra_node: fc
 memory_hierarchy:
   l0:
     type: SRAM-R
@@ -146,11 +149,11 @@ memory_hierarchy:
     scope: global
 scheduling_param:
   auto: false
-  dp: 2 # acts as replica count during inference
-  lp: 8 # pipeline stages 
-  mb: 8 # number of micro-batches
+  dp: 1
+  lp: 2 # pipeline stages 
+  mb: 1 # number of micro-batches
   t: "CR"
-  kp1: 2
+  kp1: 4
   kp2: 1
   # LSTM LEGACY PARAMS
   kp_hidden_dim1: 1
@@ -168,10 +171,10 @@ scheduling_param:
 
 
 execution_backend:
-  model: astra # analytical | astra
+  model: analytical # analytical | astra
   astra:
     backend: astra
-    mode: full_astrasim_flattened  # hybrid | full_astrasim_hierarchical | full_astrasim_flattened
+    mode: hybrid  # hybrid | full_astrasim_hierarchical | full_astrasim_flattened
     collectives:
       # Allowed values per op: auto | ring | direct | halvingDoubling | doubleBinaryTree
       # Note: if topology is 'switch' and value is 'auto', we default to 'halvingDoubling'.
@@ -183,8 +186,3 @@ execution_backend:
       endpoint_delay: 10
       active_chunks_per_dimension: 32 # Higher value means significantly slower astrasim runtime, but more accurate especially for tensor parallelism
       preferred_dataset_splits: 32 # Should be same as active_chunks_per_dimension
-      
-inference:
-  kvcache_precision: 2  # bytes per element
-  kvcache_type: "hbm_only"
-  kvcache_fetch_overlap: false

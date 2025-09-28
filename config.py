@@ -3,6 +3,7 @@ import ruamel as _ruamel
 import ruamel.yaml as _yaml
 import math
 from collections import namedtuple as _namedtuple
+from typing import Optional
 
 
 @dataclass
@@ -385,26 +386,42 @@ GEMMConfig = _namedtuple(
         "M",
         "K",
         "N",
+        "backward",
     ],
 )
-LLMConfig = _namedtuple(
-    "model_param",
+@dataclass
+class LLMAttentionConfig:
+    attention_type: str
+    num_heads: int
+    kv_heads: Optional[int] = None
+
+
+@dataclass
+class LLMConfig:
+    mode: str
+    run_type: str
+    num_layers: int
+    hidden_dim: int
+    batch_size: int
+    seq_len: int
+    decode_len: Optional[int]
+    ffn_dim: Optional[int]
+    ffn_mult: Optional[float]
+    vocab_size: int
+    n_tokens: int
+    all_reduce: str
+    attention: LLMAttentionConfig
+
+    @property
+    def num_heads(self) -> int:
+        return self.attention.num_heads
+LLMInferenceConfig = _namedtuple(
+    "inference_param",
     [
-        "mode",
-        "num_layers",
-        "hidden_dim",
-        "num_heads",
-        "batch_size",
-        "seq_len",
-        "ffn_dim",
-        "ffn_mult",
-        "vocab_size",
-        "n_tokens",
-        "communication_time",
-        "N_PP",
+        "sample_every",
     ],
 )
-SWConfig = _namedtuple("sw_param", ["kernel_launch_overhead", "precision"])
+SWConfig = _namedtuple("sw_param", ["kernel_launch_overhead", "precision", "h2d_bandwidth"])
 
 SchedulingConfig = _namedtuple(
     "scheduling_param",
@@ -412,6 +429,7 @@ SchedulingConfig = _namedtuple(
         "auto",
         "dp",
         "lp",
+        "mb",
         "kp_hidden_dim1",
         "kp_softmax_dim1",
         "kp_embedding_dim1",
@@ -446,10 +464,55 @@ FullConfig = _namedtuple(
     ],
 )
 
+ExecutionBackendAstraCollectives = _namedtuple(
+    "ExecutionBackendAstraCollectives",
+    [
+        "all_gather",
+        "all_reduce",
+        "reduce_scatter",
+        "all_to_all",
+    ],
+)
+
+ExecutionBackendAstra = _namedtuple(
+    "ExecutionBackendAstra",
+    [
+        "backend",   # analytical | ns3 | garnet
+        "mode",      # hybrid | full_astrasim_hierarchical | full_astrasim_flattened
+        "collectives",
+        "sys_options",
+    ],
+)
+
+ExecutionBackendAstraSysOptions = _namedtuple(
+    "ExecutionBackendAstraSysOptions",
+    [
+        "endpoint_delay",
+        "active_chunks_per_dimension",
+        "preferred_dataset_splits",
+    ],
+)
+
+ExecutionBackend = _namedtuple(
+    "ExecutionBackend",
+    [
+        "model",   # analytical | astra
+        "astra",   # ExecutionBackendAstra or None
+    ],
+)
+
+InferenceHWConfig = _namedtuple(
+    "InferenceHWConfig",
+    [
+        "kvcache_precision",
+        "kvcache_type",
+        "kvcache_fetch_overlap",
+    ],
+)
+
 HWConfig = _namedtuple(
     "HWConfig",
     [
-        
         "sw_config",
         "tech_config",
         "power_breakdown",
@@ -459,6 +522,8 @@ HWConfig = _namedtuple(
         "system_config",
         "memory_hierarchy",
         "network_topology",
+        "execution_backend",
+        "inference_config",
     ],
 )
 
@@ -466,7 +531,7 @@ MODELConfig = _namedtuple(
     "MODELConfig",
     [
         "model_config",
-        
+        "inference_config",
     ],
 )
 
@@ -530,7 +595,9 @@ def parse_config(filename, config_type):
         # print(config_dict) 
         convert(config_dict)
     if config_type == "hardware":
-        sw_config = SWConfig(**config_dict["sw_param"])
+        sw_params = dict(config_dict["sw_param"])
+        sw_params.setdefault("h2d_bandwidth", 12.4 * 1024 * 1024 * 1024)
+        sw_config = SWConfig(**sw_params)
         sch_config = SchedulingConfig(**config_dict["scheduling_param"])
         tech_config = TechConfig.from_dict(config_dict["tech_param"])
         power_config = PowerBreakdownConfig.from_dict(config_dict["power_breakdown"])
@@ -545,6 +612,48 @@ def parse_config(filename, config_type):
         network_topology_config = NetworkTopologyConfig.from_dict(
             config_dict["network_topology"]
         )
+        # execution backend (optional)
+        eb_dict = config_dict.get("execution_backend", {})
+        eb_model = eb_dict.get("model", "analytical")
+        astra_cfg = eb_dict.get("astra", {}) if eb_model == "astra" else None
+        if astra_cfg is not None:
+            coll = astra_cfg.get("collectives", {})
+            coll_cfg = ExecutionBackendAstraCollectives(
+                all_gather=coll.get("all_gather", "auto"),
+                all_reduce=coll.get("all_reduce", "auto"),
+                reduce_scatter=coll.get("reduce_scatter", "auto"),
+                all_to_all=coll.get("all_to_all", "auto"),
+            )
+            sys_cfg_dict = astra_cfg.get("sys_options")
+            if sys_cfg_dict is not None:
+                sys_cfg = ExecutionBackendAstraSysOptions(
+                    endpoint_delay=sys_cfg_dict.get("endpoint_delay"),
+                    active_chunks_per_dimension=sys_cfg_dict.get(
+                        "active_chunks_per_dimension"
+                    ),
+                    preferred_dataset_splits=sys_cfg_dict.get(
+                        "preferred_dataset_splits"
+                    ),
+                )
+            else:
+                sys_cfg = None
+            eb_astra = ExecutionBackendAstra(
+                backend=astra_cfg.get("backend", "analytical"),
+                mode=astra_cfg.get("mode", "hybrid"),
+                collectives=coll_cfg,
+                sys_options=sys_cfg,
+            )
+        else:
+            eb_astra = None
+        exec_backend = ExecutionBackend(model=eb_model, astra=eb_astra)
+
+        inference_dict = config_dict.get("inference", {}) or {}
+        inference_cfg = InferenceHWConfig(
+            kvcache_precision=inference_dict.get("kvcache_precision", sw_config.precision),
+            kvcache_type=inference_dict.get("kvcache_type", "hbm_only"),
+            kvcache_fetch_overlap=bool(inference_dict.get("kvcache_fetch_overlap", False)),
+        )
+
         config = HWConfig(
             sw_config=sw_config,
             tech_config=tech_config,
@@ -555,16 +664,65 @@ def parse_config(filename, config_type):
             system_config=system_config,
             memory_hierarchy=memory_hierarchy_config,
             network_topology=network_topology_config,
+            execution_backend=exec_backend,
+            inference_config=inference_cfg,
         )
     elif config_type == "LSTM":
         model_config = ModelLSTMConfig(**config_dict["model_param"])
-        config = MODELConfig(model_config=model_config)
+        config = MODELConfig(model_config=model_config, inference_config=None)
     elif config_type == "GEMM":
-        model_config = GEMMConfig(**config_dict["model_param"])
-        config = MODELConfig(model_config=model_config)
+        mp = dict(config_dict["model_param"])  # copy
+        if "backward" not in mp:
+            mp["backward"] = False
+        model_config = GEMMConfig(**mp)
+        config = MODELConfig(model_config=model_config, inference_config=None)
     elif config_type == "LLM":
-        model_config = LLMConfig(**config_dict["model_param"])
-        config = MODELConfig(model_config=model_config)
+        mp = dict(config_dict["model_param"])
+        attention_dict = mp.pop("attention", None)
+
+        if attention_dict is None:
+            legacy_heads = mp.pop("num_heads", None)
+            if legacy_heads is None:
+                raise ValueError(
+                    "model_param.attention section missing and no legacy num_heads provided"
+                )
+            attention_cfg = LLMAttentionConfig(
+                attention_type="mha",
+                num_heads=int(legacy_heads),
+            )
+        else:
+            attn_type = str(attention_dict.get("attention_type", "mha")).lower()
+            if "num_heads" not in attention_dict:
+                raise ValueError("model_param.attention.num_heads must be specified")
+            kv_heads_raw = attention_dict.get("kv_heads") if attn_type == "gqa" else None
+            attention_cfg = LLMAttentionConfig(
+                attention_type=attn_type,
+                num_heads=int(attention_dict["num_heads"]),
+                kv_heads=int(kv_heads_raw) if kv_heads_raw is not None else None,
+            )
+
+        run_type = mp.pop("run_type", "training")
+        decode_len = mp.pop("decode_len", None)
+        inference_dict = dict(config_dict.get("inference_param", {}) or {})
+        inference_config = LLMInferenceConfig(
+            sample_every=inference_dict["sample_every"],
+        )
+        model_config = LLMConfig(
+            mode=mp.pop("mode"),
+            run_type=run_type,
+            num_layers=mp.pop("num_layers"),
+            hidden_dim=mp.pop("hidden_dim"),
+            batch_size=mp.pop("batch_size"),
+            seq_len=mp.pop("seq_len"),
+            decode_len=decode_len,
+            ffn_dim=mp.pop("ffn_dim", None),
+            ffn_mult=mp.pop("ffn_mult", None),
+            vocab_size=mp.pop("vocab_size"),
+            n_tokens=mp.pop("n_tokens"),
+            all_reduce=mp.pop("all_reduce"),
+            attention=attention_cfg,
+        )
+        config = MODELConfig(model_config=model_config, inference_config=inference_config)
     else:
         raise ValueError("Invalid config type: {}".format(config_type))
     
