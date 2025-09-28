@@ -246,36 +246,39 @@ class DecodeGraph(Graph):
 
         total_time = 0.0
 
-        first_sample = samples[0]
-        seed_contribution = 0.5 * first_sample.execution_time
-        total_time += seed_contribution
-        print(
-            f"[decode] integration seed step {first_sample.step_id:04d}: "
-            f"half_weight_contribution={seed_contribution:.6f}s"
-        )
-
-        for idx in range(1, len(samples)):
-            prev_sample = samples[idx - 1]
-            sample = samples[idx]
-            step_gap = sample.step_id - prev_sample.step_id
-            if step_gap <= 0:
-                raise ValueError("Sample points must be strictly increasing")
-
-            midpoint = 0.5 * (prev_sample.execution_time + sample.execution_time)
-            segment_time = midpoint * step_gap
-            total_time += segment_time
+        if len(samples) == 1:
+            only_sample = samples[0]
+            total_time += only_sample.execution_time
             print(
-                f"[decode] integration segment {prev_sample.step_id:04d}->{sample.step_id:04d}: "
-                f"width={step_gap}, midpoint={midpoint:.6f}s, contribution={segment_time:.6f}s"
+                f"[decode] integration single sample {only_sample.step_id:04d}: "
+                f"time={only_sample.execution_time:.6f}s"
+            )
+        else:
+            seed_sample = samples[0]
+            print(
+                f"[decode] integration seed step {seed_sample.step_id:04d}: "
+                "skipping explicit contribution to avoid double counting"
             )
 
-        final_sample = samples[-1]
-        final_contribution = 0.5 * final_sample.execution_time
-        total_time += final_contribution
-        print(
-            f"[decode] integration final step {final_sample.step_id:04d}: "
-            f"half_weight_contribution={final_contribution:.6f}s"
-        )
+            # Each segment below applies the trapezoidal rule between consecutive
+            # sample points: width = step_gap and height = average runtime. This
+            # already accounts for the seed sample's contribution via the first
+            # segment (0.5 * step_gap * seed_time), so we avoid adding an extra
+            # standalone 0.5 * seed_time term that previously double counted it.
+            for idx in range(1, len(samples)):
+                prev_sample = samples[idx - 1]
+                sample = samples[idx]
+                step_gap = sample.step_id - prev_sample.step_id
+                if step_gap <= 0:
+                    raise ValueError("Sample points must be strictly increasing")
+
+                midpoint = 0.5 * (prev_sample.execution_time + sample.execution_time)
+                segment_time = midpoint * step_gap
+                total_time += segment_time
+                print(
+                    f"[decode] integration segment {prev_sample.step_id:04d}->{sample.step_id:04d}: "
+                    f"width={step_gap}, midpoint={midpoint:.6f}s, contribution={segment_time:.6f}s"
+                )
 
         last_sample = samples[-1]
         remaining_steps = self.config.decode_len - (last_sample.step_id + 1)
