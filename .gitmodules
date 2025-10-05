@@ -1,3 +1,11 @@
 [submodule "astra-sim"]
 	path = astra-sim
 	url = https://github.com/gkarfakis19/astra-sim
+
+[submodule "symbolic_tensor_graph"]
+	path = symbolic_tensor_graph
+	url = https://github.com/astra-sim/symbolic_tensor_graph
+
+[submodule "SimAI"]
+	path = SimAI
+	url = https://github.com/aliyun/SimAI
