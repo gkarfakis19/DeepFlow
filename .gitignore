@@ -36,3 +36,8 @@ mat_dims_llm.txt
 Transformer_breakdown_results.txt
 LLM_time_results.txt
 astra-sim_og/
+
+*.png
+*.et
+tools/wrapper_outputs/
+paper_primer.md

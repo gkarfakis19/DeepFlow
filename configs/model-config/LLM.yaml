@@ -19,6 +19,5 @@ model_param:
     num_layers: 16
     n_tokens: 10000000000  # Number of tokens to train on. Set to 1T for now.
     all_reduce: "every layer"  # When data parallel pre-apply grad all-reduce happens: "the end" or "every layer"
-
 inference_param:
     sample_every: -1  # Sample decode steps every N steps for efficiency. -1 means only sample at start and end.

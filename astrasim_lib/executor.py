@@ -1069,6 +1069,11 @@ def run_astra_simulation_only_onepath(
                 _visualize_et_files(et_paths)
                 _dump_et_text(et_paths)
 
+        if os.environ.get("DEEPFLOW_ASTRA_SKIP_EXEC"):
+            print("[AstraSim] DEEPFLOW_ASTRA_SKIP_EXEC set; exiting after ET artifact generation.")
+            sys.stdout.flush()
+            sys.exit(0)
+
         # Generate AstraSim configuration files using actual hardware config
         print(f"[AstraSim] Generating configuration files...")
         comm_groups_dp = dp_count if dp_override is not None else user_dp
