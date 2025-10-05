@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import json
 import yaml
@@ -25,7 +25,7 @@ WRAPPER_ROOT = Path(__file__).resolve().parent
 WRAPPER_OUTPUT_ROOT = WRAPPER_ROOT / 'wrapper_outputs'
 DEFAULT_STG_PYTHON = Path('../.venv/bin/python3')
 
-# Toggle between 'deepflow', 'deepflow_ablation', 'stg', or 'all'.
+# Toggle between 'deepflow', 'deepflow_ablation', 'stg', 'simai_analytical', or 'all'.
 RUN_SELECTION = 'deepflow'
 
 GLOBAL_CONFIG: Dict[str, object] = {
@@ -39,6 +39,10 @@ GLOBAL_CONFIG: Dict[str, object] = {
     'deepflow_ablation': {},
     'stg': {
         'python': DEFAULT_STG_PYTHON,
+    },
+    'simai_analytical': {
+        'run_binary': False,
+        'gpus_per_server': None,
     },
 }
 
@@ -177,6 +181,10 @@ import config as df_config  # type: ignore  # noqa: E402
 from astrasim_lib.config_generation import generate_astrasim_configs_from_hw  # type: ignore  # noqa: E402
 from astrasim_lib.integration import run_cache_astrasim  # type: ignore  # noqa: E402
 from astrasim_lib.et_utils import chakra_open, chakra_decode, pb  # type: ignore  # noqa: E402
+from simai_analytical import (  # type: ignore  # noqa: E402
+    SimAIAnalyticalRunner,
+    SimAIConversionError,
+)
 
 
 _HW_CONFIG_CACHE: Dict[Path, object] = {}
@@ -407,16 +415,86 @@ def run_deepflow_ablation(config: Dict[str, object]) -> Dict[str, object]:
     raise NotImplementedError('DeepFlow ablation workflow not implemented yet.')
 
 
+def run_simai_analytical(config: Dict[str, object]) -> Dict[str, object]:
+    hardware_cfg = Path(config['hardware_config'])
+    model_cfg = Path(config['model_config'])
+    ensure_path_exists(hardware_cfg, 'hardware config')
+    ensure_path_exists(model_cfg, 'model config')
+
+    dest_root = WRAPPER_OUTPUT_ROOT / 'simai_analytical'
+    if dest_root.exists():
+        shutil.rmtree(dest_root)
+    dest_root.mkdir(parents=True, exist_ok=True)
+
+    runner = SimAIAnalyticalRunner(repo_root=REPO_ROOT)
+
+    start_time = time.perf_counter()
+    try:
+        artifacts = runner.generate_artifacts(
+            hardware_config=hardware_cfg,
+            model_config=model_cfg,
+            output_dir=dest_root,
+        )
+    except SimAIConversionError as exc:  # pragma: no cover - defensive
+        raise RuntimeError(f"SimAI conversion failed: {exc}") from exc
+    duration = time.perf_counter() - start_time
+
+    workload_rel = artifacts.workload_path.relative_to(dest_root)
+    busbw_rel = artifacts.busbw_path.relative_to(dest_root)
+    print('[Wrapper] SimAI analytical workload synthesized:')
+    print(f"  - Workload: {workload_rel}")
+    print(f"  - Bus bandwidth: {busbw_rel}")
+    print(f"  - Records: {len(artifacts.records)}")
+
+    simai_cfg = config.get('simai_analytical', {}) if isinstance(config.get('simai_analytical'), dict) else {}
+    run_binary = bool(simai_cfg.get('run_binary', False)) and not bool(config.get('dry_run', False))
+    gpus_per_server = simai_cfg.get('gpus_per_server')
+    binary_path = REPO_ROOT / 'SimAI' / 'bin' / 'SimAI_analytical'
+    simai_returncode: Optional[int] = None
+
+    if run_binary:
+        ensure_path_exists(binary_path, 'SimAI analytical binary')
+        result_dir = dest_root / 'simai_results'
+        result_dir.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            str(binary_path),
+            '-w', str(artifacts.workload_path),
+            '-g', str(artifacts.parallel_config.all_gpus),
+            '-g_p_s', str(int(gpus_per_server) if gpus_per_server else max(1, artifacts.parallel_config.tensor_parallel)),
+            '-r', str(result_dir / 'run-'),
+            '-busbw', str(artifacts.busbw_path),
+        ]
+        print(f"[Wrapper] Launching SimAI binary: {' '.join(cmd)}")
+        binary_start = time.perf_counter()
+        proc = subprocess.run(cmd, cwd=REPO_ROOT / 'SimAI', check=False)
+        duration += time.perf_counter() - binary_start
+        simai_returncode = proc.returncode
+        if proc.returncode != 0:
+            raise RuntimeError(f"SimAI analytical binary exited with code {proc.returncode}")
+
+    return {
+        'mode': 'simai_analytical',
+        'duration_seconds': duration,
+        'artifact_dir': dest_root,
+        'workload_path': artifacts.workload_path,
+        'busbw_path': artifacts.busbw_path,
+        'simai_returncode': simai_returncode,
+        'ran_binary': run_binary,
+        'dry_run': bool(config.get('dry_run', False)),
+    }
+
+
 def dispatch(selection: str, config: Dict[str, object]) -> List[Dict[str, object]]:
     handlers = {
         'deepflow': run_deepflow_annotated,
         'deepflow_ablation': run_deepflow_ablation,
         'stg': run_stg,
+        'simai_analytical': run_simai_analytical,
     }
 
     if selection == 'all':
         results: List[Dict[str, object]] = []
-        for key in ['deepflow', 'deepflow_ablation', 'stg']:
+        for key in ['deepflow', 'deepflow_ablation', 'stg', 'simai_analytical']:
             results.append(handlers[key](config))
         return results
 
