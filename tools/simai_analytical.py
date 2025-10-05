@@ -28,9 +28,9 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 import yaml
 
@@ -181,12 +181,30 @@ class _LayerAccumulator:
 
     forward_compute_s: float = 0.0
     backward_compute_s: float = 0.0
-    forward_comm_bytes: int = 0
+    forward_comm_bytes: float = 0.0
     forward_comm_label: Optional[str] = None
-    input_grad_comm_bytes: int = 0
+    input_grad_comm_bytes: float = 0.0
     input_grad_comm_label: Optional[str] = None
-    weight_grad_comm_bytes: int = 0
+    weight_grad_comm_bytes: float = 0.0
     weight_grad_comm_label: Optional[str] = None
+    forward_tp_ranks: Set[int] = field(default_factory=set)
+    backward_tp_ranks: Set[int] = field(default_factory=set)
+    forward_comm_tp_ranks: Set[int] = field(default_factory=set)
+    input_grad_comm_tp_ranks: Set[int] = field(default_factory=set)
+    weight_grad_comm_tp_ranks: Set[int] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class _RecordKey:
+    """Dictionary key describing a unique SimAI workload record."""
+
+    stage_id: int
+    micro_batch: int
+    layer_index: Optional[int]
+    alias: str
+
+
+_RANK_SENTINEL = -1
 
 
 class SimAIWorkloadBuilder:
@@ -210,54 +228,48 @@ class SimAIWorkloadBuilder:
             specific pipeline stage and micro-batch combination.
         """
 
-        accumulators: Dict[Tuple[int, int, int], _LayerAccumulator] = defaultdict(_LayerAccumulator)
-        stage_names: Dict[int, str] = {}
+        accumulators: Dict[_RecordKey, _LayerAccumulator] = defaultdict(_LayerAccumulator)
 
         for obj in _iter_graph(self._root):
+            key = _make_record_key(obj)
+            if key is None:
+                continue
+            acc = accumulators[key]
+            tp_rank = getattr(obj, "tp_rank", None)
+
             if isinstance(obj, simulate_LLM.Node):
-                stage_id = getattr(obj, "stage_id", getattr(obj, "hw_id", None))
-                layer_index = getattr(obj, "layer_index", None)
-                micro_batch = getattr(obj, "micro_batch_index", 0)
-                if stage_id is None or layer_index is None:
-                    # Only transformer nodes are tagged with the metadata we need.
-                    # Skip everything else (embeddings, optimizer, etc.).
-                    continue
-                stage_names.setdefault(int(stage_id), f"stage{int(stage_id)}")
-                key = (int(stage_id), int(layer_index), int(micro_batch or 0))
-                acc = accumulators[key]
                 direction = getattr(obj, "direction", "forward" if obj.fwd else "backward")
+                duration = float(getattr(obj, "duration", 0.0) or 0.0)
                 if direction == "forward":
-                    acc.forward_compute_s += float(getattr(obj, "duration", 0.0))
+                    acc.forward_compute_s += duration
+                    _register_rank(acc.forward_tp_ranks, tp_rank)
                 else:
                     # We currently do not distinguish between weight-gradient and
                     # input-gradient compute – treat everything as part of the
                     # backward slice and expose it via the weight-grad column.
-                    acc.backward_compute_s += float(getattr(obj, "duration", 0.0))
+                    acc.backward_compute_s += duration
+                    _register_rank(acc.backward_tp_ranks, tp_rank)
             elif isinstance(obj, simulate_LLM.Edge):
                 comm_type = getattr(obj, "comm_type", None)
                 if comm_type in {None, "pipeline"}:
                     continue
-                stage_id = getattr(obj, "stage_id", None)
-                layer_index = getattr(obj, "layer_index", None)
-                micro_batch = getattr(obj, "micro_batch_index", 0)
-                if stage_id is None or layer_index is None:
-                    continue
-                key = (int(stage_id), int(layer_index), int(micro_batch or 0))
-                acc = accumulators[key]
                 direction = getattr(obj, "direction", "forward")
                 label = _COMM_BASE_LABELS.get(str(comm_type).lower(), "NONE")
                 suffix = _COMM_SUFFIXES.get(getattr(obj, "comm_interconnect_type", None), "")
                 label = f"{label}{suffix}" if label != "NONE" else label
-                size_bytes = int(getattr(obj, "comm_size_bytes", 0) or 0)
+                size_bytes = float(getattr(obj, "comm_size_bytes", 0) or 0)
                 if direction == "forward":
                     acc.forward_comm_bytes += size_bytes
                     acc.forward_comm_label = _merge_comm_label(acc.forward_comm_label, label)
+                    _register_rank(acc.forward_comm_tp_ranks, tp_rank)
                 elif direction == "input_grad":
                     acc.input_grad_comm_bytes += size_bytes
                     acc.input_grad_comm_label = _merge_comm_label(acc.input_grad_comm_label, label)
+                    _register_rank(acc.input_grad_comm_tp_ranks, tp_rank)
                 else:
                     acc.weight_grad_comm_bytes += size_bytes
                     acc.weight_grad_comm_label = _merge_comm_label(acc.weight_grad_comm_label, label)
+                    _register_rank(acc.weight_grad_comm_tp_ranks, tp_rank)
 
         if not accumulators:
             raise SimAIConversionError(
@@ -265,23 +277,35 @@ class SimAIWorkloadBuilder:
             )
 
         records: List[SimAIRecord] = []
-        for (stage_id, layer_index, micro_batch) in sorted(accumulators.keys(), key=lambda tpl: (tpl[2], tpl[1], tpl[0])):
-            acc = accumulators[(stage_id, layer_index, micro_batch)]
-            layer_name = f"stage{stage_id:02d}_layer{layer_index:03d}_mb{micro_batch:02d}"
+        for key in sorted(accumulators.keys(), key=_record_sort_key):
+            acc = accumulators[key]
+            forward_div = _rank_count(acc.forward_tp_ranks)
+            backward_div = _rank_count(acc.backward_tp_ranks)
+            fwd_comm_div = _rank_count(acc.forward_comm_tp_ranks)
+            ig_comm_div = _rank_count(acc.input_grad_comm_tp_ranks)
+            wg_comm_div = _rank_count(acc.weight_grad_comm_tp_ranks)
+
+            layer_fragment = (
+                f"layer{key.layer_index:03d}" if key.layer_index is not None else key.alias
+            )
+            layer_name = f"stage{key.stage_id:02d}_{layer_fragment}_mb{key.micro_batch:02d}"
+            fwd_bytes = _normalize_comm_bytes(acc.forward_comm_bytes, fwd_comm_div)
+            ig_bytes = _normalize_comm_bytes(acc.input_grad_comm_bytes, ig_comm_div)
+            wg_bytes = _normalize_comm_bytes(acc.weight_grad_comm_bytes, wg_comm_div)
             records.append(
                 SimAIRecord(
                     name=layer_name,
                     dependency=-1,
-                    fwd_time_us=_seconds_to_microseconds(acc.forward_compute_s),
-                    fwd_comm=_normalize_comm_label(acc.forward_comm_label, acc.forward_comm_bytes),
-                    fwd_bytes=max(0, acc.forward_comm_bytes),
+                    fwd_time_us=_seconds_to_microseconds(acc.forward_compute_s / forward_div if acc.forward_compute_s else 0.0),
+                    fwd_comm=_normalize_comm_label(acc.forward_comm_label, fwd_bytes),
+                    fwd_bytes=fwd_bytes,
                     ig_time_us=0,
-                    ig_comm=_normalize_comm_label(acc.input_grad_comm_label, acc.input_grad_comm_bytes),
-                    ig_bytes=max(0, acc.input_grad_comm_bytes),
-                    wg_time_us=_seconds_to_microseconds(acc.backward_compute_s),
-                    wg_comm=_normalize_comm_label(acc.weight_grad_comm_label, acc.weight_grad_comm_bytes),
-                    wg_bytes=max(0, acc.weight_grad_comm_bytes),
-                    wg_update_time_us=0,
+                    ig_comm=_normalize_comm_label(acc.input_grad_comm_label, ig_bytes),
+                    ig_bytes=ig_bytes,
+                    wg_time_us=_seconds_to_microseconds(acc.backward_compute_s / backward_div if acc.backward_compute_s else 0.0),
+                    wg_comm=_normalize_comm_label(acc.weight_grad_comm_label, wg_bytes),
+                    wg_bytes=wg_bytes,
+                    wg_update_time_us=100,
                 )
             )
         return records
@@ -305,6 +329,66 @@ def _normalize_comm_label(label: Optional[str], size_bytes: int) -> str:
     if not label or size_bytes <= 0:
         return "NONE"
     return label
+
+
+def _normalize_comm_bytes(size_bytes: float, divisor: int) -> int:
+    if size_bytes <= 0:
+        return 0
+    return int(round(size_bytes / max(1, divisor)))
+
+
+def _register_rank(container: Set[int], rank: Optional[int]) -> None:
+    if rank is None:
+        container.add(_RANK_SENTINEL)
+    else:
+        container.add(int(rank))
+
+
+def _rank_count(ranks: Set[int]) -> int:
+    if not ranks:
+        return 1
+    actual = {rk for rk in ranks if rk >= 0}
+    if actual:
+        return max(1, len(actual))
+    return 1
+
+
+def _sanitize_alias(raw: str) -> str:
+    if not raw:
+        return "extra"
+    sanitized = ''.join(ch if ch.isalnum() or ch in {'_', '-'} else '_' for ch in str(raw))
+    sanitized = sanitized.strip('_') or 'extra'
+    return sanitized[:40]
+
+
+def _make_record_key(obj: object) -> Optional[_RecordKey]:
+    stage_id = getattr(obj, "stage_id", getattr(obj, "hw_id", None))
+    if stage_id is None:
+        return None
+    micro_batch = getattr(obj, "micro_batch_index", 0) or 0
+    layer_index = getattr(obj, "layer_index", None)
+
+    if layer_index is not None:
+        alias = f"layer{int(layer_index):03d}"
+        numeric_layer = int(layer_index)
+    else:
+        alias_source = getattr(obj, "name", None)
+        if not alias_source:
+            alias_source = f"op{getattr(obj, 'op_id', 0)}"
+        alias = _sanitize_alias(alias_source)
+        numeric_layer = None
+
+    return _RecordKey(
+        stage_id=int(stage_id),
+        micro_batch=int(micro_batch),
+        layer_index=numeric_layer,
+        alias=alias,
+    )
+
+
+def _record_sort_key(key: _RecordKey) -> Tuple[int, float, int, str]:
+    layer_sort = key.layer_index if key.layer_index is not None else math.inf
+    return (key.micro_batch, layer_sort, key.stage_id, key.alias)
 
 
 @dataclass
@@ -501,11 +585,17 @@ def _derive_parallel_spec(time_calc: TimeCalculationLLM, pipeline_graph: simulat
             except Exception:
                 pp_comm = 0
 
+    num_layers = getattr(time_calc, "num_layers", None)
+    if num_layers is None:
+        num_layers = getattr(getattr(time_calc, "model", None), "num_layers", None)
+    if num_layers is None:
+        num_layers = getattr(pipeline_graph, "num_layer", 1)
+
     return SimAIParallelConfig(
         tensor_parallel=tp_degree,
         expert_parallel=ep,
         pipeline_parallel=lp,
-        virtual_pipeline=1,
+        virtual_pipeline=max(1, int(num_layers)),
         data_parallel=dp,
         micro_batches=mb,
         pp_comm_bytes=pp_comm,
@@ -517,4 +607,3 @@ __all__ = [
     "SimAIAnalyticalArtifacts",
     "SimAIConversionError",
 ]
-

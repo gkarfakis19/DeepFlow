@@ -449,6 +449,9 @@ def run_simai_analytical(config: Dict[str, object]) -> Dict[str, object]:
     simai_cfg = config.get('simai_analytical', {}) if isinstance(config.get('simai_analytical'), dict) else {}
     run_binary = bool(simai_cfg.get('run_binary', False)) and not bool(config.get('dry_run', False))
     gpus_per_server = simai_cfg.get('gpus_per_server')
+    if gpus_per_server is None:
+        hw_cfg_obj = _load_hw_config_object(hardware_cfg)
+        gpus_per_server = getattr(getattr(hw_cfg_obj, 'system_hierarchy', None), 'num_devices_per_node', None)
     binary_path = REPO_ROOT / 'SimAI' / 'bin' / 'SimAI_analytical'
     simai_returncode: Optional[int] = None
 
