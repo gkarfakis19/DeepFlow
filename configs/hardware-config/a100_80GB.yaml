@@ -119,7 +119,7 @@ perimeter_breakdown:
   intra_node: 0.33
   inter_node: 0.33
 system_hierarchy:
-  num_devices_per_node: 32
+  num_devices_per_node: 1
   num_nodes: 1
   inter_derate: 1
   intra_derate: 1
@@ -146,11 +146,11 @@ memory_hierarchy:
     scope: global
 scheduling_param:
   auto: false
-  dp: 2 # acts as replica count during inference
-  lp: 8 # pipeline stages 
-  mb: 8 # number of micro-batches
+  dp: 1 # acts as replica count during inference
+  lp: 1 # pipeline stages 
+  mb: 1 # number of micro-batches
   t: "CR"
-  kp1: 2
+  kp1: 1
   kp2: 1
   # LSTM LEGACY PARAMS
   kp_hidden_dim1: 1
