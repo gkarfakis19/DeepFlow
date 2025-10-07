@@ -2,6 +2,7 @@
 
 from .bootstrap import ensure_chakra_available
 from .config_generation import (
+    reset_json_cache,
     compute_intra_inter_ib_ll_from_hw,
     derive_topology_from_hw,
     generate_astrasim_configs_from_hw,
@@ -31,6 +32,7 @@ __all__ = [
     "ASTRA_DEBUG",
     "ensure_chakra_available",
     "ensure_cache_file_exists",
+    "reset_json_cache",
     "compute_intra_inter_ib_ll_from_hw",
     "derive_topology_from_hw",
     "generate_astrasim_configs_from_hw",

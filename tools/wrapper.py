@@ -26,13 +26,14 @@ WRAPPER_OUTPUT_ROOT = WRAPPER_ROOT / 'wrapper_outputs'
 DEFAULT_STG_PYTHON = Path('../.venv/bin/python3')
 
 # Toggle between 'deepflow', 'deepflow_ablation', 'stg', 'simai_analytical', or 'all'.
-RUN_SELECTION = 'deepflow'
+RUN_SELECTION = 'all'
 
 GLOBAL_CONFIG: Dict[str, object] = {
     'hardware_config': REPO_ROOT / 'configs/hardware-config/a100_80GB.yaml',
     'model_config': REPO_ROOT / 'configs/model-config/LLM.yaml',
-    'dry_run': True,
+    'dry_run': False,
     'generate_visuals': True,
+    'isol_astra': True, # force "deepflow" mode to run AstraSim the exact same way as "stg" mode. Set to True for best comparisons.
     'deepflow': {
         'additional_env': {}
     },
@@ -95,11 +96,13 @@ def run_deepflow_annotated(config: Dict[str, object]) -> Dict[str, object]:
         shutil.rmtree(dest_root)
     dest_root.mkdir(parents=True, exist_ok=True)
 
+    isol_astra = bool(config.get('isol_astra', False))
+
     env = os.environ.copy()
     env['DEEPFLOW_PERSIST_ASTRASIM_ARTIFACTS'] = '1'
     if generate_visuals:
         env['DEEPFLOW_PERSIST_ARTIFACT_VIZ'] = '1'
-    if dry_run:
+    if dry_run or isol_astra:
         env['DEEPFLOW_ASTRA_SKIP_EXEC'] = '1'
     else:
         env.pop('DEEPFLOW_ASTRA_SKIP_EXEC', None)
@@ -128,6 +131,33 @@ def run_deepflow_annotated(config: Dict[str, object]) -> Dict[str, object]:
 
     summaries = snapshot_summary_files(dest_root)
 
+    manifest_path: Path | None = None
+    per_rank: List[float] = []
+    total_time = None
+    if not dry_run and isol_astra:
+        et_files = sorted(dest_root.glob('llm_graph.*.et'))
+        if not et_files:
+            raise RuntimeError('DeepFlow isolated AstraSim: no ET files found')
+        manifest_path = _build_manifest(et_files, dest_root)
+        hw_obj = _load_hw_config_object(hardware_cfg)
+        astra_config_dir = dest_root / 'astrasim_configs'
+        astra_config_dir.mkdir(parents=True, exist_ok=True)
+        reset_json_cache()
+        generate_astrasim_configs_from_hw(hw_obj, out_dir=str(astra_config_dir), npus_count=len(et_files), roofline_enabled=False)
+        cache_path = astra_config_dir / 'cache.json'
+        per_rank, total_time = run_cache_astrasim(
+            hw_obj,
+            comm='graph',
+            npus_count=len(et_files),
+            size_bytes=0,
+            astra_config_dir=str(astra_config_dir),
+            cache_path=str(cache_path),
+            manifest_json_path=str(manifest_path),
+            workload_prefix=str(dest_root / 'llm_graph'),
+            comm_group_json=None,
+        )
+        print(f"[Wrapper] DeepFlow AstraSim total: {total_time:.6f} s")
+
     print('[Wrapper] DeepFlow annotated run complete:')
     print(f"  - Duration: {duration:.2f} s")
     print(f"  - Artifacts directory: {dest_root}")
@@ -145,6 +175,9 @@ def run_deepflow_annotated(config: Dict[str, object]) -> Dict[str, object]:
         'artifact_dir': dest_root,
         'summaries': summaries,
         'dry_run': dry_run,
+        'manifest': manifest_path,
+        'astrasim_total_time': total_time,
+        'astrasim_per_rank': per_rank,
     }
 
 
@@ -178,7 +211,7 @@ def _ensure_sys_path() -> None:
 
 _ensure_sys_path()
 import config as df_config  # type: ignore  # noqa: E402
-from astrasim_lib.config_generation import generate_astrasim_configs_from_hw  # type: ignore  # noqa: E402
+from astrasim_lib.config_generation import generate_astrasim_configs_from_hw, reset_json_cache  # type: ignore  # noqa: E402
 from astrasim_lib.integration import run_cache_astrasim  # type: ignore  # noqa: E402
 from astrasim_lib.et_utils import chakra_open, chakra_decode, pb  # type: ignore  # noqa: E402
 from simai_analytical import (  # type: ignore  # noqa: E402
@@ -282,7 +315,7 @@ def run_stg(config: Dict[str, object]) -> Dict[str, object]:
     kp1 = int(sched.get('kp1', 1) or 1)
     kp2 = int(sched.get('kp2', 1) or 1)
     tp = max(1, kp1 * kp2)
-    mb = int(sched.get('mb', 1))
+    mb = int(sched.get('mb', 1) or 1)
 
     model_param = model_data.get('model_param', {}) or {}
     batch_size = int(model_param.get('batch_size', 1))
@@ -305,13 +338,17 @@ def run_stg(config: Dict[str, object]) -> Dict[str, object]:
     stg_cfg = config.get('stg', {}) if isinstance(config.get('stg'), dict) else {}
     python_path = stg_cfg.get('python', DEFAULT_STG_PYTHON)
     python_exe = Path(python_path)
-    ensure_path_exists(python_exe, 'STG Python interpreter')
+    # ensure_path_exists(python_exe, 'STG Python interpreter') # check fails as path is from stg root not this tool root
 
     stg_root = REPO_ROOT / 'symbolic_tensor_graph'
     staging_dir = stg_root / 'generated' / 'wrapper_tmp'
     if staging_dir.exists():
         shutil.rmtree(staging_dir)
     staging_dir.mkdir(parents=True, exist_ok=True)
+
+    micro_batch_size = batch_size // (dp * mb) if dp * mb else batch_size
+    if micro_batch_size <= 0 or micro_batch_size * dp * mb != batch_size:
+        raise ValueError("STG: batch_size must equal dp * micro_batch_size * mb")
 
     cmd = [
         str(python_exe),
@@ -324,7 +361,7 @@ def run_stg(config: Dict[str, object]) -> Dict[str, object]:
         '--sp', '1',
         '--ep', '1',
         '--batch', str(batch_size),
-        '--micro_batch', str(mb),
+        '--micro_batch', str(micro_batch_size),
         '--seq', str(seq_len),
         '--dmodel', str(hidden_dim),
         '--dff', str(ffn_dim),
@@ -355,12 +392,14 @@ def run_stg(config: Dict[str, object]) -> Dict[str, object]:
     if generate_visuals:
         vis_targets = [str(p) for p in sorted(dest_root.glob('workload.*.et'))[:10]]
         if vis_targets:
-            try:
-                from astrasim_lib.executor import _dump_et_text, _visualize_et_files
-                _visualize_et_files(vis_targets)
-                _dump_et_text(vis_targets)
-            except Exception as exc:
-                print(f"[Wrapper] STG visualization failed: {exc}")
+            # try:
+            from astrasim_lib.executor import _dump_et_text
+            from astrasim_lib import stg_viz
+            render_dir = dest_root
+            stg_viz.render_stg_bundle(vis_targets, render_dir)
+            _dump_et_text(vis_targets)
+            # except Exception as exc:
+            #     print(f"[Wrapper] STG visualization failed: {exc}")
 
     dry_run = bool(config.get('dry_run', False))
     manifest_path: Path | None = None
@@ -373,7 +412,8 @@ def run_stg(config: Dict[str, object]) -> Dict[str, object]:
         hw_obj = _load_hw_config_object(hardware_cfg)
         astra_config_dir = dest_root / 'astrasim_configs'
         astra_config_dir.mkdir(parents=True, exist_ok=True)
-        generate_astrasim_configs_from_hw(hw_obj, out_dir=str(astra_config_dir), npus_count=len(et_files))
+        reset_json_cache()
+        generate_astrasim_configs_from_hw(hw_obj, out_dir=str(astra_config_dir), npus_count=len(et_files), roofline_enabled=True)
         cache_path = astra_config_dir / 'cache.json'
         comm_group_json = dest_root / 'workload.json'
         if not comm_group_json.exists():
@@ -497,7 +537,13 @@ def dispatch(selection: str, config: Dict[str, object]) -> List[Dict[str, object
 
     if selection == 'all':
         results: List[Dict[str, object]] = []
-        for key in ['deepflow', 'deepflow_ablation', 'stg', 'simai_analytical']:
+        mode_ls = [
+            'deepflow',
+            'stg',
+            # 'deepflow_ablation',
+            # 'simai_analytical',
+        ]
+        for key in mode_ls:
             results.append(handlers[key](config))
         return results
 

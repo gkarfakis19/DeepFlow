@@ -6,6 +6,7 @@ import os
 from typing import Any, Dict, Optional, Tuple
 
 from hw_component import Network
+from hw_component import Core as HWCore
 
 from .bootstrap import ensure_chakra_available
 
@@ -19,6 +20,9 @@ ASTRA_DEBUG = False
 _NET_YAML_CACHE: set[tuple[str, int, float, float, str]] = set()
 _JSON_WRITTEN_BY_NPUS: set[object] = set()
 
+
+def reset_json_cache():
+    _JSON_WRITTEN_BY_NPUS.clear()
 
 def _save_json(path: str, data: Dict[str, Any], npus_key: Optional[int] = None) -> None:
     """Write ``data`` to ``path`` once per ``npus_key`` per process."""
@@ -86,6 +90,7 @@ def generate_astrasim_configs_from_hw(
     hw_obj,
     out_dir: str = "./astra_cache",
     npus_count: Optional[int] = None,
+    roofline_enabled: bool = False,
 ) -> Dict[str, str]:
     """Write AstraSim network/system configs derived from ``hw_obj``."""
     if npus_count is None:
@@ -148,6 +153,46 @@ def generate_astrasim_configs_from_hw(
         a2a = choose_collective("auto", topo, "all-to-all")
         sys_opts = None
 
+    local_mem_bw = getattr(hw_obj.tech_config.DRAM, 'bandwidth', None)
+    if local_mem_bw is None or float(local_mem_bw) <= 0:
+        raise ValueError('Hardware config must specify positive DRAM bandwidth for roofline mode')
+    local_mem_bw_gbps = float(local_mem_bw)
+
+    try:
+        peak_perf_ops = float(HWCore(hw_obj).throughput)
+    except Exception as exc:
+        raise ValueError('Failed to compute peak throughput from hardware config') from exc
+    if peak_perf_ops <= 0:
+        raise ValueError('Hardware config produced non-positive peak throughput')
+    peak_perf_tflops = peak_perf_ops / 1e12
+
+
+    local_mem_bw_bytes = float(getattr(hw_obj.tech_config.DRAM, 'bandwidth', 0.0) or 0.0)
+    local_mem_bw_gbps = round(local_mem_bw_bytes / 1e9, 6) if local_mem_bw_bytes > 0 else 0.0
+
+    peak_perf_ops = 0.0
+    try:
+        core_cfg = hw_obj.tech_config.core
+        freq = core_cfg.operating_frequency or core_cfg.nominal_frequency or 0.0
+        if freq > 0 and core_cfg.num_mcu_per_bundle:
+            num_bundles = core_cfg.num_bundles
+            if num_bundles is None:
+                num_bundles = 0
+            num_mcu = num_bundles * core_cfg.num_mcu_per_bundle if num_bundles else 0
+            if num_mcu > 0:
+                peak_perf_ops = num_mcu * core_cfg.nominal_flop_rate_per_mcu * freq * (core_cfg.util or 1.0)
+    except Exception:
+        peak_perf_ops = 0.0
+    if peak_perf_ops <= 0:
+        try:
+            peak_perf_ops = HWCore(hw_obj).throughput
+        except Exception:
+            peak_perf_ops = 0.0
+    peak_perf_tflops = round(peak_perf_ops / 1e12, 6) if peak_perf_ops > 0 else 0.0
+    if peak_perf_tflops <= 0:
+        peak_perf_tflops = 1.0
+    if local_mem_bw_gbps <= 0:
+        local_mem_bw_gbps = 1.0
     system = {
         "scheduling-policy": "LIFO",
         "endpoint-delay": 10,
@@ -158,10 +203,10 @@ def generate_astrasim_configs_from_hw(
         "reduce-scatter-implementation": [rs],
         "all-to-all-implementation": [a2a],
         "collective-optimization": "localBWAware",
-        "local-mem-bw": 1600,
+        "local-mem-bw": local_mem_bw_gbps,
         "boost-mode": 0,
-        "roofline-enabled": 0,
-        "peak-perf": 900,
+        "roofline-enabled": 1 if roofline_enabled else 0,
+        "peak-perf": peak_perf_tflops,
     }
     if sys_opts is not None:
         if getattr(sys_opts, "endpoint_delay", None) is not None:
@@ -171,6 +216,7 @@ def generate_astrasim_configs_from_hw(
         if getattr(sys_opts, "preferred_dataset_splits", None) is not None:
             system["preferred-dataset-splits"] = sys_opts.preferred_dataset_splits
 
+    print("SAVING JSON (***************) TO ", sys_json)
     _save_json(sys_json, system, npus_key=int(npus_count))
 
     return {"network_yaml": net_yaml, "system_json": sys_json}
@@ -182,4 +228,5 @@ __all__ = [
     "compute_intra_inter_ib_ll_from_hw",
     "derive_topology_from_hw",
     "generate_astrasim_configs_from_hw",
+    "reset_json_cache",
 ]
