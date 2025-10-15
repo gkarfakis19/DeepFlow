@@ -349,7 +349,7 @@ def run_stg(config: Dict[str, object]) -> Dict[str, object]:
     micro_batch_size = batch_size // (dp * mb) if dp * mb else batch_size
     if micro_batch_size <= 0 or micro_batch_size * dp * mb != batch_size:
         raise ValueError("STG: batch_size must equal dp * micro_batch_size * mb")
-
+        
     cmd = [
         str(python_exe),
         'main.py',
