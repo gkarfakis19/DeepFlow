@@ -412,6 +412,12 @@ class TimeCalculation:
                 print(f"miniB: {self.miniB}, mb: {self.mb}")
                 raise ValueError("Batch size must be divisible by micro-batch size")
             self.microB = math.ceil(self.miniB / self.mb) if self.lp > 1 else self.miniB # micro-batch size for each pipeline stage
+            # === TODO(LLM_COMPARE_ROOFLINE_INTEGRATION) =================================
+            # The llm-compare branch forced microB to divide by lp (microB/(mb*lp))
+            # and threaded GEMM FLOP/tensor-byte metadata into the downstream AstraSim
+            # ET generation. Re-evaluate whether we need that behaviour once the
+            # roofline path is reintroduced.
+            # === END TODO ==============================================================
             self.attention_type = self.model.attention_type
             self.flash_attention = getattr(self.model, 'use_flashattention', False)
             self.kv_heads = self.model.kv_heads if hasattr(self.model, 'kv_heads') else self.num_heads

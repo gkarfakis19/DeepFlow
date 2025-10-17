@@ -158,6 +158,21 @@ class DecodeGraph(Graph):
             output_dir="./output_graph/",
         )
 
+        # === TODO(LLM_COMPARE_ROOFLINE_INTEGRATION) ==============================
+        # llm-compare measured per-GEMM FLOPs and tensor bytes during decode by
+        # calling `_distributed_gemm_forward` and caching the results as:
+        #
+        #     gemm_results = {
+        #         "qkv_proj": {
+        #             "flops": ..., "input_bytes": ..., "output_bytes": ...,
+        #         },
+        #         ...
+        #     }
+        #
+        # That metadata fed into AstraSim ET attributes. Reapply when we
+        # resurrect the roofline comparison path.
+        # === END TODO ============================================================
+
         base_dir = temp_time_calc.output_dir.rstrip(os.sep)
         sample_dir = os.path.join(base_dir, "decode_samples", f"step_{step_id:04d}")
         root_dir = os.path.dirname(sample_dir)

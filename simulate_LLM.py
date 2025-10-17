@@ -11,7 +11,7 @@ debug = False
 BYTES_PER_GIB = 1024 ** 3
 
 class Node:
-    def __init__(self, name, op_id, hw_id, duration, fwd=True, *, is_kv_cache=False):
+    def __init__(self, name, op_id, hw_id, duration, fwd=True, *, is_kv_cache=False, flops=0, tensor_bytes=0):
         self.name = name
         self.op_id = op_id
         self.hw_id = hw_id
@@ -24,6 +24,8 @@ class Node:
         self.fwd = fwd  # forward or backward
         self.scheduled = False
         self.is_kv_cache = is_kv_cache
+        self.flops = flops  # FLOPs for roofline mode (optional, 0 if not provided)
+        self.tensor_bytes = tensor_bytes  # Tensor size in bytes for roofline mode (optional, 0 if not provided)
 
     def add_child(self, obj):
         self.children.append(obj)
@@ -126,6 +128,22 @@ class Graph:
     def _time(self, key: str, default: float = 0.0) -> float:
         value = self.comp_times.get(key)
         return float(value) if value is not None else default
+
+    def _metadata(self, key: str, default_flops: float = 0.0, default_bytes: float = 0.0) -> tuple:
+        """Extract FLOP and tensor byte metadata for a computation key.
+
+        Args:
+            key: Base key in comp_times (e.g., 'transformer_f')
+            default_flops: Default FLOP count if not found
+            default_bytes: Default tensor bytes if not found
+
+        Returns:
+            (flops, tensor_bytes) tuple
+        """
+        flops = self.comp_times.get(f"{key}_flops", default_flops)
+        bytes_val = self.comp_times.get(f"{key}_bytes", default_bytes)
+        return (float(flops) if flops is not None else default_flops,
+                float(bytes_val) if bytes_val is not None else default_bytes)
 
     def create_comm_edge(self, name, op_id, comm_key, is_all_reduce=False, local_hw_id=None):
         """Create a communication edge with optional local computation node.
@@ -550,6 +568,14 @@ class Graph:
         kv_cache_store_time = self._time("kv_cache_store")
         fetch_overlap_enabled = bool(self.misc_metadata.get("kv_cache_fetch_overlap", False))
 
+        # Extract metadata for nodes
+        embedding_f_flops, embedding_f_bytes = self._metadata("embedding_f")
+        embedding_b_flops, embedding_b_bytes = self._metadata("embedding_b")
+        linear_softmax_f_flops, linear_softmax_f_bytes = self._metadata("linear_softmax_f")
+        linear_softmax_b_flops, linear_softmax_b_bytes = self._metadata("linear_softmax_b")
+        transformer_f_flops, transformer_f_bytes = self._metadata("transformer_f")
+        transformer_b_flops, transformer_b_bytes = self._metadata("transformer_b")
+
 
         if include_backward:
             embedding_node_b = [[] for _ in range(self.num_batch)]
@@ -573,10 +599,12 @@ class Graph:
             data_batch_node[i-1].add_child(data_batch_node[i])
 
         for b in range(self.num_batch): #connect each data batch node with corresponding nodes
-            linear_softmax = Node(f"linear_softmax{b}", op_id, self.lp-1, linear_softmax_f_time)
+            linear_softmax = Node(f"linear_softmax{b}", op_id, self.lp-1, linear_softmax_f_time,
+                                  flops=linear_softmax_f_flops, tensor_bytes=linear_softmax_f_bytes)
             op_id += 1
             softmax_node.append(linear_softmax)
-            emb = Node(f"embedding{b}", op_id, 0, embedding_f_time)      # hw_id = 0
+            emb = Node(f"embedding{b}", op_id, 0, embedding_f_time,
+                       flops=embedding_f_flops, tensor_bytes=embedding_f_bytes)      # hw_id = 0
             op_id += 1
             embedding_node.append(emb)
             data_batch_node[b].add_child(embedding_node[b])
@@ -588,7 +616,8 @@ class Graph:
 
             for l in range(self.num_layer):
                 hw_id = min(l // self.layer_per_device , self.lp - 1)#assign hw_id for transformer
-                transformer_node = Node("transformer", op_id, hw_id, transformer_f_time)
+                transformer_node = Node("transformer", op_id, hw_id, transformer_f_time,
+                                        flops=transformer_f_flops, tensor_bytes=transformer_f_bytes)
                 transformer_node.micro_batch_index = b
                 transformer_node.layer_index = l
                 transformer_node.direction = "forward"
@@ -717,10 +746,12 @@ class Graph:
             return embedding_node[0]
 
         for b in reversed(range(self.num_batch)): #connect each data batch node with corresponding nodes
-            emb_b = Node("embedding_b", op_id, 0, embedding_b_time, fwd=False)      # hw_id = 0
+            emb_b = Node("embedding_b", op_id, 0, embedding_b_time, fwd=False,
+                         flops=embedding_b_flops, tensor_bytes=embedding_b_bytes)      # hw_id = 0
             op_id += 1
             embedding_node_b[b] = emb_b
-            linear_softmax_b = Node("linear_softmax_b", op_id, self.lp-1, linear_softmax_b_time, fwd=False)
+            linear_softmax_b = Node("linear_softmax_b", op_id, self.lp-1, linear_softmax_b_time, fwd=False,
+                                    flops=linear_softmax_b_flops, tensor_bytes=linear_softmax_b_bytes)
             op_id += 1
             softmax_node_b[b] = linear_softmax_b
             softmax_node[b].add_child(linear_softmax_b)
@@ -729,7 +760,8 @@ class Graph:
             for l in reversed(range(self.num_layer)):
 
                 hw_id = min(l // self.layer_per_device , self.lp - 1)
-                transformer_node_b = Node("transformer_b", op_id, hw_id, transformer_b_time, fwd=False)
+                transformer_node_b = Node("transformer_b", op_id, hw_id, transformer_b_time, fwd=False,
+                                          flops=transformer_b_flops, tensor_bytes=transformer_b_bytes)
                 transformer_node_b.micro_batch_index = b
                 transformer_node_b.layer_index = l
                 transformer_node_b.direction = "backward"
@@ -879,12 +911,17 @@ class Graph:
                     if fwd_duration is None:
                         raise ValueError("Transformer GEMM entry missing forward duration")
 
+                    fwd_flops = forward_cfg.get("flops", 0)
+                    fwd_bytes = forward_cfg.get("bytes", 0)
+
                     node = Node(
                         name=f"{entry_name}_fwd_rank{rank}",
                         op_id=op_id,
                         hw_id=rank,
                         duration=fwd_duration,
                         fwd=True,
+                        flops=fwd_flops,
+                        tensor_bytes=fwd_bytes,
                     )
                     op_id += 1
                     previous.add_child(node)
@@ -919,12 +956,17 @@ class Graph:
                     if bwd_duration is None:
                         raise ValueError("Transformer GEMM entry missing backward duration")
 
+                    bwd_flops = backward_cfg.get("flops", 0)
+                    bwd_bytes = backward_cfg.get("bytes", 0)
+
                     node = Node(
                         name=f"{entry_name}_bwd_rank{rank}",
                         op_id=op_id,
                         hw_id=rank,
                         duration=bwd_duration,
                         fwd=False,
+                        flops=bwd_flops,
+                        tensor_bytes=bwd_bytes,
                     )
                     op_id += 1
                     previous.add_child(node)

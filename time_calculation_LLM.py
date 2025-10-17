@@ -128,6 +128,47 @@ class GemmType(Enum):
     FFN2 = "ffn2"
     LINEAR_SOFTMAX = "linear_softmax"
 
+# === TODO(LLM_COMPARE_ROOFLINE_INTEGRATION) ==================================
+# The llm-compare branch emitted FLOP / tensor-byte metadata and flattened
+# pipeline graphs before exporting ET files. When we are ready to reintegrate
+# that functionality, pull the helpers below (captured verbatim from commit
+# fbcca79) and thread the resulting metadata through the call sites that build
+# compute/communication nodes:
+#
+# class PipelineGraphFlattener:
+#     """Expand pipeline transformer nodes into explicit tensor-parallel subgraphs."""
+#     ...
+#     def _clone(self, obj: Any) -> Any:
+#         if isinstance(obj, simulate_LLM.Node):
+#             ...
+#             cloned = simulate_LLM.Node(
+#                 obj.name,
+#                 self._next_op_id(),
+#                 obj.hw_id,
+#                 obj.duration,
+#                 fwd=obj.fwd,
+#                 is_kv_cache=getattr(obj, "is_kv_cache", False),
+#                 flops=getattr(obj, "flops", 0),
+#                 tensor_bytes=getattr(obj, "tensor_bytes", 0),
+#             )
+#             ...
+#     def _expand_transformer_node(...):
+#         ...
+#         comp_node = simulate_LLM.Node(
+#             f"{gemm_name}_{direction}",
+#             self._next_op_id(),
+#             self._hw_id_for_rank(stage_id, tp_rank),
+#             duration,
+#             fwd=direction == "fwd",
+#             flops=gemm_entry.get("flops", 0),
+#             tensor_bytes=gemm_entry.get("tensor_bytes", 0),
+#         )
+#
+# That code also introduced ExecutionResult / TransformerTimings dataclasses and
+# recorded GEMM-level FLOPs and tensor bytes inside compute_all_gemm_and_node_times.
+# Keep those snippets handy when we revisit roofline support.
+# === END TODO(LLM_COMPARE_ROOFLINE_INTEGRATION) ===============================
+
 
 class TimeCalculationLLM(TimeCalculation):
     def __init__(self, hw_config, model_config, mode, output_dir: Optional[str] = None):

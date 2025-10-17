@@ -203,6 +203,15 @@ def _visualize_et_files(et_paths: List[str]) -> None:
     if not et_paths:
         return
 
+# === TODO(LLM_COMPARE_ROOFLINE_INTEGRATION) ===================================
+# llm-compare annotated compute nodes with FLOP/tensor-byte metadata before
+# writing ET files (see commit fbcca79) so AstraSim roofline mode could infer
+# local computation costs. When we restore that workflow, thread the recorded
+# values through convert_deepflow_graph_to_chakra_et and pass them into
+# `new_comp_node(..., flops=..., tensor_bytes=...)`.
+# === END TODO =================================================================
+
+
     def _render_et_file(et_path: str) -> None:
         try:
             fh = chakra_open(et_path)
@@ -1068,11 +1077,6 @@ def run_astra_simulation_only_onepath(
                 print(f"[AstraSim] Visualizing {len(et_paths)} persisted ET files...")
                 _visualize_et_files(et_paths)
                 _dump_et_text(et_paths)
-
-        if os.environ.get("DEEPFLOW_ASTRA_SKIP_EXEC"):
-            print("[AstraSim] DEEPFLOW_ASTRA_SKIP_EXEC set; exiting after ET artifact generation.")
-            sys.stdout.flush()
-            sys.exit(0)
 
         # Generate AstraSim configuration files using actual hardware config
         print(f"[AstraSim] Generating configuration files...")

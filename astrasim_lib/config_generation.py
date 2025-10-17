@@ -216,7 +216,6 @@ def generate_astrasim_configs_from_hw(
         if getattr(sys_opts, "preferred_dataset_splits", None) is not None:
             system["preferred-dataset-splits"] = sys_opts.preferred_dataset_splits
 
-    print("SAVING JSON (***************) TO ", sys_json)
     _save_json(sys_json, system, npus_key=int(npus_count))
 
     return {"network_yaml": net_yaml, "system_json": sys_json}

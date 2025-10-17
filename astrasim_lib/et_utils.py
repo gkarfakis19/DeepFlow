@@ -86,8 +86,16 @@ def new_recv_node(node_id: int, name: str, size_bytes: int, src_rank: int, tag: 
     return node
 
 
-def new_comp_node(node_id: int, name: str, duration_micros: float) -> pb.Node:
-    """Return a compute placeholder node lasting ``duration_micros`` microseconds."""
+def new_comp_node(node_id: int, name: str, duration_micros: float, flops: int = 0, tensor_bytes: int = 0) -> pb.Node:
+    """Return a compute placeholder node lasting ``duration_micros`` microseconds.
+
+    Args:
+        node_id: Unique node ID
+        name: Node name
+        duration_micros: Duration in microseconds
+        flops: Number of FLOPs (for roofline mode, optional)
+        tensor_bytes: Tensor size in bytes (for roofline mode, optional)
+    """
 
     node = pb.Node()
     node.id = node_id
@@ -95,6 +103,11 @@ def new_comp_node(node_id: int, name: str, duration_micros: float) -> pb.Node:
     node.type = pb.COMP_NODE
     node.duration_micros = duration_micros
     node.attr.append(pb.AttributeProto(name="is_cpu_op", bool_val=False))
+
+    # Add roofline metadata (always set, even if 0, so roofline mode works correctly)
+    node.attr.append(pb.AttributeProto(name="num_ops", uint64_val=int(flops)))
+    node.attr.append(pb.AttributeProto(name="tensor_size", uint64_val=int(tensor_bytes)))
+
     return node
 
 

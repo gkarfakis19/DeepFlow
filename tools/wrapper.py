@@ -145,6 +145,7 @@ def run_deepflow_annotated(config: Dict[str, object]) -> Dict[str, object]:
         reset_json_cache()
         generate_astrasim_configs_from_hw(hw_obj, out_dir=str(astra_config_dir), npus_count=len(et_files), roofline_enabled=False)
         cache_path = astra_config_dir / 'cache.json'
+        comm_groups_path = dest_root / 'comm_groups.json'
         per_rank, total_time = run_cache_astrasim(
             hw_obj,
             comm='graph',
@@ -154,7 +155,7 @@ def run_deepflow_annotated(config: Dict[str, object]) -> Dict[str, object]:
             cache_path=str(cache_path),
             manifest_json_path=str(manifest_path),
             workload_prefix=str(dest_root / 'llm_graph'),
-            comm_group_json=None,
+            comm_group_json=str(comm_groups_path) if comm_groups_path.exists() else None,
         )
         print(f"[Wrapper] DeepFlow AstraSim total: {total_time:.6f} s")
 
@@ -452,7 +453,107 @@ def run_stg(config: Dict[str, object]) -> Dict[str, object]:
     }
 
 def run_deepflow_ablation(config: Dict[str, object]) -> Dict[str, object]:
-    raise NotImplementedError('DeepFlow ablation workflow not implemented yet.')
+    """Run DeepFlow to generate ETs with metadata, then execute AstraSim in roofline mode."""
+    hardware_cfg = Path(config['hardware_config'])
+    model_cfg = Path(config['model_config'])
+    ensure_path_exists(hardware_cfg, 'hardware config')
+    ensure_path_exists(model_cfg, 'model config')
+
+    dry_run = bool(config.get('dry_run', False))
+    generate_visuals = bool(config.get('generate_visuals', False))
+
+    dest_root = WRAPPER_OUTPUT_ROOT / 'deepflow_ablation'
+    if dest_root.exists():
+        shutil.rmtree(dest_root)
+    dest_root.mkdir(parents=True, exist_ok=True)
+
+    # Run DeepFlow to generate ETs with FLOP/byte metadata, but skip AstraSim execution
+    env = os.environ.copy()
+    env['DEEPFLOW_PERSIST_ASTRASIM_ARTIFACTS'] = '1'
+    env['DEEPFLOW_ASTRA_SKIP_EXEC'] = '1'  # Always skip DeepFlow's AstraSim execution
+    if generate_visuals:
+        env['DEEPFLOW_PERSIST_ARTIFACT_VIZ'] = '1'
+
+    extra_env: Dict[str, object] = {}
+    if isinstance(config.get('deepflow_ablation'), dict):
+        extra_env = config['deepflow_ablation'].get('additional_env', {}) or {}
+    for key, value in extra_env.items():
+        env[str(key)] = str(value)
+
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / 'run_perf.py'),
+        '--hardware_config', str(hardware_cfg),
+        '--model_config', str(model_cfg),
+    ]
+
+    print('[Wrapper] DeepFlow ablation: generating ETs with metadata...')
+    start_time = time.perf_counter()
+    result = subprocess.run(cmd, cwd=REPO_ROOT, env=env, check=False, stdout=sys.stdout, stderr=sys.stderr)
+    duration = time.perf_counter() - start_time
+    if result.returncode != 0:
+        raise RuntimeError(f"DeepFlow ablation execution failed with return code {result.returncode}")
+
+    # Copy generated ET artifacts
+    artifact_src = REPO_ROOT / 'output' / 'LLM' / 'astra_flat'
+    ensure_path_exists(artifact_src, 'DeepFlow flattened AstraSim artifacts')
+    copied_artifacts = copy_top_level_files(artifact_src, dest_root)
+
+    summaries = snapshot_summary_files(dest_root)
+
+    # Run AstraSim in roofline mode
+    manifest_path: Path | None = None
+    per_rank: List[float] = []
+    total_time = None
+
+    if not dry_run:
+        et_files = sorted(dest_root.glob('llm_graph.*.et'))
+        if not et_files:
+            raise RuntimeError('DeepFlow ablation: no ET files found')
+
+        print('[Wrapper] DeepFlow ablation: running AstraSim in roofline mode...')
+        manifest_path = _build_manifest(et_files, dest_root)
+        hw_obj = _load_hw_config_object(hardware_cfg)
+        astra_config_dir = dest_root / 'astrasim_configs'
+        astra_config_dir.mkdir(parents=True, exist_ok=True)
+        reset_json_cache()
+        generate_astrasim_configs_from_hw(hw_obj, out_dir=str(astra_config_dir), npus_count=len(et_files), roofline_enabled=True)
+        cache_path = astra_config_dir / 'cache.json'
+        comm_groups_path = dest_root / 'comm_groups.json'
+        per_rank, total_time = run_cache_astrasim(
+            hw_obj,
+            comm='graph',
+            npus_count=len(et_files),
+            size_bytes=0,
+            astra_config_dir=str(astra_config_dir),
+            cache_path=str(cache_path),
+            manifest_json_path=str(manifest_path),
+            workload_prefix=str(dest_root / 'llm_graph'),
+            comm_group_json=str(comm_groups_path) if comm_groups_path.exists() else None,
+        )
+        print(f"[Wrapper] DeepFlow ablation AstraSim total: {total_time:.6f} s")
+
+    print('[Wrapper] DeepFlow ablation run complete:')
+    print(f"  - Duration: {duration:.2f} s")
+    print(f"  - Artifacts directory: {dest_root}")
+    for path in copied_artifacts:
+        print(f"    • {path.name}")
+    if summaries:
+        for path in summaries:
+            print(f"    • summary: {path.name}")
+    else:
+        print('    • summary: (none found)')
+
+    return {
+        'mode': 'deepflow_ablation',
+        'duration_seconds': duration,
+        'artifact_dir': dest_root,
+        'summaries': summaries,
+        'dry_run': dry_run,
+        'manifest': manifest_path,
+        'astrasim_total_time': total_time,
+        'astrasim_per_rank': per_rank,
+    }
 
 
 def run_simai_analytical(config: Dict[str, object]) -> Dict[str, object]:
@@ -539,8 +640,8 @@ def dispatch(selection: str, config: Dict[str, object]) -> List[Dict[str, object
         results: List[Dict[str, object]] = []
         mode_ls = [
             'deepflow',
+            'deepflow_ablation',
             'stg',
-            # 'deepflow_ablation',
             # 'simai_analytical',
         ]
         for key in mode_ls:

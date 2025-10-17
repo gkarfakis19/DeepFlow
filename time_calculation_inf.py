@@ -7,6 +7,12 @@ from time_calculation_LLM import LLMExecutionDispatcher, TimeCalculationLLM, Gem
 from simulate_inf import DecodeSample, InferenceConfig, InferenceEngine
 import LLM_util
 
+# === TODO(LLM_COMPARE_ROOFLINE_INTEGRATION) =====================================
+# llm-compare injected FLOP/tensor-byte metadata into inference prefill +
+# decode timing so the wrapper could run roofline-mode AstraSim. Keep commit
+# fbcca79 handy and reapply the instrumentation hooks when we revive that path.
+# === END TODO ===================================================================
+
 
 class TimeCalculationLLMInference(TimeCalculationLLM):
     """Inference-specialized facade for ``TimeCalculationLLM``."""
