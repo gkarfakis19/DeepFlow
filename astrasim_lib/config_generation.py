@@ -15,7 +15,7 @@ from .bootstrap import ensure_chakra_available
 # same setup entry point for consistency.
 ensure_chakra_available()
 
-ASTRA_DEBUG = False
+ASTRA_DEBUG = True
 
 _NET_YAML_CACHE: set[tuple[str, int, float, float, str]] = set()
 _JSON_WRITTEN_BY_NPUS: set[object] = set()

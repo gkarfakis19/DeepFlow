@@ -30,10 +30,13 @@ RUN_SELECTION = 'all'
 
 GLOBAL_CONFIG: Dict[str, object] = {
     'hardware_config': REPO_ROOT / 'configs/hardware-config/a100_80GB.yaml',
-    'model_config': REPO_ROOT / 'configs/model-config/LLM.yaml',
+    # 'model_config': REPO_ROOT / 'configs/model-config/LLM.yaml',
+    # 'model_config': REPO_ROOT / 'configs/model-config/Llama2-7B.yaml',
+    'model_config': REPO_ROOT / 'configs/model-config/Llama3.1-405B.yaml',
     'dry_run': False,
     'generate_visuals': True,
     'isol_astra': True, # force "deepflow" mode to run AstraSim the exact same way as "stg" mode. Set to True for best comparisons.
+    'zero_softmax': True,
     'deepflow': {
         'additional_env': {}
     },
@@ -46,6 +49,8 @@ GLOBAL_CONFIG: Dict[str, object] = {
         'gpus_per_server': None,
     },
 }
+
+TEXT_ONLY_VIZ = True
 
 
 def ensure_path_exists(path: Path, description: str) -> None:
@@ -128,6 +133,8 @@ def run_deepflow_annotated(config: Dict[str, object]) -> Dict[str, object]:
     artifact_src = REPO_ROOT / 'output' / 'LLM' / 'astra_flat'
     ensure_path_exists(artifact_src, 'DeepFlow flattened AstraSim artifacts')
     copied_artifacts = copy_top_level_files(artifact_src, dest_root)
+    if config.get('zero_softmax'):
+        _zero_softmax_nodes(dest_root)
 
     summaries = snapshot_summary_files(dest_root)
 
@@ -214,7 +221,7 @@ _ensure_sys_path()
 import config as df_config  # type: ignore  # noqa: E402
 from astrasim_lib.config_generation import generate_astrasim_configs_from_hw, reset_json_cache  # type: ignore  # noqa: E402
 from astrasim_lib.integration import run_cache_astrasim  # type: ignore  # noqa: E402
-from astrasim_lib.et_utils import chakra_open, chakra_decode, pb  # type: ignore  # noqa: E402
+from astrasim_lib.et_utils import chakra_open, chakra_decode, chakra_encode, write_et_node, pb  # type: ignore  # noqa: E402
 from simai_analytical import (  # type: ignore  # noqa: E402
     SimAIAnalyticalRunner,
     SimAIConversionError,
@@ -301,6 +308,164 @@ def _build_manifest(et_files: List[Path], dest_dir: Path) -> Path:
     return manifest_path
 
 
+def _scale_comm_attrs(node: pb.Node, scale: int) -> None:
+    if scale == 1:
+        return
+    for field_desc, value in node.ListFields():
+        if field_desc.name == "comm_size":
+            node.comm_size = int(value * scale)
+    for attr in node.attr:
+        if attr.name == "comm_size":
+            which = attr.WhichOneof("value")
+            if not which:
+                continue
+            current = getattr(attr, which)
+            setattr(attr, which, int(current * scale))
+
+
+def _scale_tensor_sizes(node: pb.Node, scale: int) -> None:
+    if scale == 1:
+        return
+    for field_desc, value in node.ListFields():
+        if field_desc.name == "tensor_size":
+            node.tensor_size = int(value * scale)
+        elif field_desc.name == "duration_micros":
+            continue
+    for attr in node.attr:
+        if attr.name == "tensor_size":
+            which = attr.WhichOneof("value")
+            if not which:
+                continue
+            current = getattr(attr, which)
+            setattr(attr, which, int(current * scale))
+        elif attr.name == "inputs" or attr.name == "outputs":
+            which = attr.WhichOneof("value")
+            if not which:
+                continue
+            values = getattr(attr, which)
+            if hasattr(values, "values"):
+                for idx in range(1, len(values.values), 2):
+                    try:
+                        current_val = float(values.values[idx])
+                    except ValueError:
+                        continue
+                    values.values[idx] = str(int(current_val * scale))
+
+
+def _get_op_type(node: pb.Node) -> Optional[str]:
+    for attr in node.attr:
+        if attr.name == "op_type":
+            which = attr.WhichOneof("value")
+            if not which:
+                continue
+            raw = getattr(attr, which)
+            return str(raw)
+    return None
+
+
+def _scale_num_ops(node: pb.Node, scale: float) -> None:
+    if abs(scale - 1.0) < 1e-9:
+        return
+        
+    for field_desc, value in node.ListFields():
+        if field_desc.name == "num_ops":
+            node.num_ops = int(round(float(value) * scale))
+    for attr in node.attr:
+        if attr.name == "num_ops":
+            which = attr.WhichOneof("value")
+            if not which:
+                continue
+            current = getattr(attr, which)
+            setattr(attr, which, int(round(float(current) * scale)))
+
+
+def _scale_stg_et_comm_sizes(et_files: List[Path], precision_bytes: float) -> None:
+    if precision_bytes is None:
+        return
+    scale = float(precision_bytes)
+    if scale <= 0:
+        raise ValueError(f"Invalid precision scaling factor: {scale}")
+    if abs(scale - 1.0) < 1e-9:
+        return
+    scale_int = int(round(scale))
+    if abs(scale - scale_int) > 1e-9:
+        raise ValueError(f"Non-integer precision scaling unsupported: {scale}")
+    print(f"[Wrapper] Scaling STG ET comm/tensor sizes by factor {scale_int}")
+    for et_path in et_files:
+        fh = chakra_open(str(et_path))
+        nodes: List[pb.Node] = []
+        try:
+            meta = pb.GlobalMetadata()
+            if not chakra_decode(fh, meta):
+                raise RuntimeError(f"Failed to decode metadata for {et_path}")
+            while True:
+                node = pb.Node()
+                if not chakra_decode(fh, node):
+                    break
+                node_type = int(node.type)
+                if node_type in (pb.COMM_COLL_NODE, pb.COMM_SEND_NODE, pb.COMM_RECV_NODE):
+                    _scale_comm_attrs(node, scale_int)
+                if node_type in (pb.COMP_NODE, pb.MEM_LOAD_NODE, pb.MEM_STORE_NODE):
+                    _scale_tensor_sizes(node, scale_int)
+                if node_type == pb.COMP_NODE:
+                    op_type = _get_op_type(node)
+                    if op_type == "M":
+                        _scale_num_ops(node, 2.0)
+                nodes.append(node)
+        finally:
+            fh.close()
+        with et_path.open("wb") as out_fh:
+            chakra_encode(out_fh, meta)
+            for node in nodes:
+                write_et_node(out_fh, node)
+
+
+def _zero_node_metrics(node: pb.Node) -> None:
+    for field_desc, value in node.ListFields():
+        if field_desc.name == "duration_micros":
+            node.duration_micros = 1
+        elif field_desc.name == "tensor_size":
+            node.tensor_size = 1
+    for attr in node.attr:
+        which = attr.WhichOneof("value")
+        if not which:
+            continue
+        if attr.name in {"num_ops", "tensor_size", "duration_micros"}:
+            current = getattr(attr, which)
+            setattr(attr, which, type(current)(1))
+
+
+def _zero_softmax_nodes(dest_root: Path) -> None:
+    et_files = list(dest_root.glob("*.et"))
+    if not et_files:
+        return
+    for et_path in et_files:
+        fh = chakra_open(str(et_path))
+        nodes: List[pb.Node] = []
+        modified = False
+        try:
+            meta = pb.GlobalMetadata()
+            if not chakra_decode(fh, meta):
+                continue
+            while True:
+                node = pb.Node()
+                if not chakra_decode(fh, node):
+                    break
+                name = getattr(node, "name", "")
+                if "pt_attention_scale_softmax" in name:
+                    _zero_node_metrics(node)
+                    modified = True
+                nodes.append(node)
+        finally:
+            fh.close()
+        if not modified:
+            continue
+        with et_path.open("wb") as out_fh:
+            chakra_encode(out_fh, meta)
+            for node in nodes:
+                write_et_node(out_fh, node)
+
+
 def run_stg(config: Dict[str, object]) -> Dict[str, object]:
     hardware_cfg = Path(config['hardware_config'])
     model_cfg = Path(config['model_config'])
@@ -310,22 +475,29 @@ def run_stg(config: Dict[str, object]) -> Dict[str, object]:
     hw_data = _load_yaml(hardware_cfg)
     model_data = _load_yaml(model_cfg)
 
+    sw_param = hw_data.get('sw_param', {}) or {}
+    precision = sw_param.get('precision', 1)
+    try:
+        precision = float(precision)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid precision value in hardware config: {precision}") from None
+
     sched = hw_data.get('scheduling_param', {}) or {}
-    dp = int(sched.get('dp', 1))
-    lp = int(sched.get('lp', 1))
-    kp1 = int(sched.get('kp1', 1) or 1)
-    kp2 = int(sched.get('kp2', 1) or 1)
+    dp = int(sched['dp'])
+    lp = int(sched['lp'])
+    kp1 = int(sched['kp1'])
+    kp2 = int(sched['kp2'])
     tp = max(1, kp1 * kp2)
-    mb = int(sched.get('mb', 1) or 1)
+    mb = int(sched['mb'])
 
     model_param = model_data.get('model_param', {}) or {}
-    batch_size = int(model_param.get('batch_size', 1))
-    seq_len = int(model_param.get('seq_len', 1))
-    hidden_dim = int(model_param.get('hidden_dim', 1))
-    num_layers = int(model_param.get('num_layers', 1))
-    vocab_size = int(model_param.get('vocab_size', 32000))
-    attention_cfg = model_param.get('attention', {}) or {}
-    num_heads = int(attention_cfg.get('num_heads', 1))
+    batch_size = int(model_param['batch_size'])
+    seq_len = int(model_param['seq_len'])
+    hidden_dim = int(model_param['hidden_dim'])
+    num_layers = int(model_param['num_layers'])
+    vocab_size = int(model_param['vocab_size'])
+    attention_cfg = model_param['attention']
+    num_heads = int(attention_cfg['num_heads'])
     kv_heads = int(attention_cfg.get('kv_heads', num_heads))
     ffn_dim = _compute_ffn_dim(model_param, hidden_dim)
 
@@ -346,11 +518,8 @@ def run_stg(config: Dict[str, object]) -> Dict[str, object]:
     if staging_dir.exists():
         shutil.rmtree(staging_dir)
     staging_dir.mkdir(parents=True, exist_ok=True)
+    micro_batch_size = batch_size // (mb)    
 
-    micro_batch_size = batch_size // (dp * mb) if dp * mb else batch_size
-    if micro_batch_size <= 0 or micro_batch_size * dp * mb != batch_size:
-        raise ValueError("STG: batch_size must equal dp * micro_batch_size * mb")
-        
     cmd = [
         str(python_exe),
         'main.py',
@@ -385,6 +554,7 @@ def run_stg(config: Dict[str, object]) -> Dict[str, object]:
     et_files = sorted(staging_dir.glob('workload.*.et'))
     if not et_files:
         raise RuntimeError('STG generator produced no ET files')
+    _scale_stg_et_comm_sizes(et_files, precision)
 
     dest_root = WRAPPER_OUTPUT_ROOT / 'stg'
     copied_artifacts = copy_top_level_files(staging_dir, dest_root)
@@ -397,7 +567,8 @@ def run_stg(config: Dict[str, object]) -> Dict[str, object]:
             from astrasim_lib.executor import _dump_et_text
             from astrasim_lib import stg_viz
             render_dir = dest_root
-            stg_viz.render_stg_bundle(vis_targets, render_dir)
+            if not TEXT_ONLY_VIZ:
+                stg_viz.render_stg_bundle(vis_targets, render_dir)
             _dump_et_text(vis_targets)
             # except Exception as exc:
             #     print(f"[Wrapper] STG visualization failed: {exc}")
@@ -498,6 +669,8 @@ def run_deepflow_ablation(config: Dict[str, object]) -> Dict[str, object]:
     artifact_src = REPO_ROOT / 'output' / 'LLM' / 'astra_flat'
     ensure_path_exists(artifact_src, 'DeepFlow flattened AstraSim artifacts')
     copied_artifacts = copy_top_level_files(artifact_src, dest_root)
+    if config.get('zero_softmax'):
+        _zero_softmax_nodes(dest_root)
 
     summaries = snapshot_summary_files(dest_root)
 
