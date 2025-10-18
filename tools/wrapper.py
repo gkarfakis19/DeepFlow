@@ -36,7 +36,11 @@ GLOBAL_CONFIG: Dict[str, object] = {
     'dry_run': False,
     'generate_visuals': True,
     'isol_astra': True, # force "deepflow" mode to run AstraSim the exact same way as "stg" mode. Set to True for best comparisons.
+    # Diagnostic toggles: set to True to neutralize specific kernels so DeepFlow and STG can be compared apples-to-apples.
+    # - zero_softmax: convert attention softmax nodes into 1-op/1-byte stubs across all ET bundles.
+    # - zero_embedding: do the same for embedding/in_emb/out_emb nodes (helps when STG models embedding as a dense GEMM).
     'zero_softmax': True,
+    'zero_embedding': False,
     'deepflow': {
         'additional_env': {}
     },
@@ -51,6 +55,9 @@ GLOBAL_CONFIG: Dict[str, object] = {
 }
 
 TEXT_ONLY_VIZ = True
+_FAKE_DURATION_US = 1
+_FAKE_NUM_OPS = 1_000_000
+_FAKE_TENSOR_SIZE = 1024
 
 
 def ensure_path_exists(path: Path, description: str) -> None:
@@ -134,7 +141,9 @@ def run_deepflow_annotated(config: Dict[str, object]) -> Dict[str, object]:
     ensure_path_exists(artifact_src, 'DeepFlow flattened AstraSim artifacts')
     copied_artifacts = copy_top_level_files(artifact_src, dest_root)
     if config.get('zero_softmax'):
-        _zero_softmax_nodes(dest_root)
+        _zero_named_nodes(dest_root, ["pt_attention_scale_softmax"])
+    if config.get('zero_embedding'):
+        _zero_named_nodes(dest_root, ["embedding", "in_emb", "out_emb"])
 
     summaries = snapshot_summary_files(dest_root)
 
@@ -423,21 +432,27 @@ def _scale_stg_et_comm_sizes(et_files: List[Path], precision_bytes: float) -> No
 def _zero_node_metrics(node: pb.Node) -> None:
     for field_desc, value in node.ListFields():
         if field_desc.name == "duration_micros":
-            node.duration_micros = 1
+            node.duration_micros = _FAKE_DURATION_US
         elif field_desc.name == "tensor_size":
-            node.tensor_size = 1
+            node.tensor_size = _FAKE_TENSOR_SIZE
     for attr in node.attr:
         which = attr.WhichOneof("value")
         if not which:
             continue
         if attr.name in {"num_ops", "tensor_size", "duration_micros"}:
             current = getattr(attr, which)
-            setattr(attr, which, type(current)(1))
+            value = _FAKE_NUM_OPS if attr.name == "num_ops" else (
+                _FAKE_TENSOR_SIZE if attr.name == "tensor_size" else _FAKE_DURATION_US
+            )
+            setattr(attr, which, type(current)(value))
 
 
-def _zero_softmax_nodes(dest_root: Path) -> None:
+def _zero_named_nodes(dest_root: Path, substrings: List[str]) -> None:
     et_files = list(dest_root.glob("*.et"))
     if not et_files:
+        return
+    substrings = [s for s in substrings if s]
+    if not substrings:
         return
     for et_path in et_files:
         fh = chakra_open(str(et_path))
@@ -452,7 +467,7 @@ def _zero_softmax_nodes(dest_root: Path) -> None:
                 if not chakra_decode(fh, node):
                     break
                 name = getattr(node, "name", "")
-                if "pt_attention_scale_softmax" in name:
+                if any(sub in name for sub in substrings):
                     _zero_node_metrics(node)
                     modified = True
                 nodes.append(node)
@@ -558,6 +573,10 @@ def run_stg(config: Dict[str, object]) -> Dict[str, object]:
 
     dest_root = WRAPPER_OUTPUT_ROOT / 'stg'
     copied_artifacts = copy_top_level_files(staging_dir, dest_root)
+    if config.get('zero_softmax'):
+        _zero_named_nodes(dest_root, ["pt_attention_scale_softmax"])
+    if config.get('zero_embedding'):
+        _zero_named_nodes(dest_root, ["embedding", "in_emb", "out_emb"])
 
     generate_visuals = bool(config.get('generate_visuals', False))
     if generate_visuals:
@@ -670,7 +689,9 @@ def run_deepflow_ablation(config: Dict[str, object]) -> Dict[str, object]:
     ensure_path_exists(artifact_src, 'DeepFlow flattened AstraSim artifacts')
     copied_artifacts = copy_top_level_files(artifact_src, dest_root)
     if config.get('zero_softmax'):
-        _zero_softmax_nodes(dest_root)
+        _zero_named_nodes(dest_root, ["pt_attention_scale_softmax"])
+    if config.get('zero_embedding'):
+        _zero_named_nodes(dest_root, ["embedding", "in_emb", "out_emb"])
 
     summaries = snapshot_summary_files(dest_root)
 
