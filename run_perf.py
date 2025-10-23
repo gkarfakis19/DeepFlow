@@ -25,6 +25,11 @@ validating_v100 = True
 # Cache handling policy for AstraSim integration.
 # Options: "NO CACHE", "CACHE READONLY", "CACHE READWRITE"
 cache_handling = "CACHE READWRITE"
+# === TODO(LLM_COMPARE_ROOFLINE_INTEGRATION) =================================
+# llm-compare forced this default to "NO_CACHE" so repeated wrapper runs would
+# regenerate ET artifacts. Restore that behaviour once the comparison tooling
+# is reconciled.
+# === END TODO ================================================================
 _CACHE_MODE_MAP = {
     "NO CACHE": "NO_CACHE",
     "CACHE READONLY": "CACHE_READONLY",

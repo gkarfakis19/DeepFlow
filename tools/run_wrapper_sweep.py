@@ -3,7 +3,7 @@
 
 This script:
   1. Modifies a copy of the A100 hardware config for each sweep point
-  2. Invokes the wrapper harness (DeepFlow, DeepFlow ablation, STG) for every config
+  2. Invokes the wrapper harness (DeepFlow, DeepFlow ablation, STG, MLSynth) for every config
   3. Streams results into a CSV as soon as each run completes
   4. Generates a summary line plot comparing AstraSim runtimes across tools
 
@@ -45,31 +45,38 @@ MODELS = [
         "path": REPO_ROOT / "configs" / "model-config" / "Llama2-7B.yaml",
         "name": "Llama2-7B",
     },
-    {
-        "path": REPO_ROOT / "configs" / "model-config" / "Llama3.1-70B.yaml",
-        "name": "Llama3.1-70B_8k",
-    },
-    {
-        "path": REPO_ROOT / "configs" / "model-config" / "Llama3.1-70B_32k.yaml",
-        "name": "Llama3.1-70B_32k",
-    },
-    {
-        "path": REPO_ROOT / "configs" / "model-config" / "Llama3.1-70B_128k.yaml",
-        "name": "Llama3.1-70B_128k",
-    },
-    {
-        "path": REPO_ROOT / "configs" / "model-config" / "Llama3.1-405B.yaml",
-        "name": "Llama3.1-405B",
-    },
+    # {
+    #     "path": REPO_ROOT / "configs" / "model-config" / "Llama3.1-70B.yaml",
+    #     "name": "Llama3.1-70B_8k",
+    # },
+    # {
+    #     "path": REPO_ROOT / "configs" / "model-config" / "Llama3.1-70B_32k.yaml",
+    #     "name": "Llama3.1-70B_32k",
+    # },
+    # {
+    #     "path": REPO_ROOT / "configs" / "model-config" / "Llama3.1-70B_128k.yaml",
+    #     "name": "Llama3.1-70B_128k",
+    # },
+    # {
+    #     "path": REPO_ROOT / "configs" / "model-config" / "Llama3.1-405B.yaml",
+    #     "name": "Llama3.1-405B",
+    # },
 ]
 
 DP_VALUES = [1, 4]
 LP_VALUES = [1, 2, 4, 8, 16]
 
+SWEEP_MODE = "mb_sweep"  # "default" | "mb_sweep"
+MB_SWEEP_DP = 4
+MB_SWEEP_LP = 4
+
+MB_VALUES = [1, 2, 4, 8, 16] # only for mb_sweep. Multiple of LP.
+
 MODE_LABELS = {
     "deepflow": "DeepFlow",
     "deepflow_ablation": "DeepFlow Ablation",
     "stg": "STG",
+    "mlsynth": "MLSynth",
 }
 
 CSV_FIELDS = [
@@ -100,15 +107,23 @@ def build_config_label(lp: int, mb: int) -> str:
 
 
 def determine_mb_values(lp: int) -> List[int]:
+    if SWEEP_MODE == "mb_sweep":
+        return [lp * factor for factor in MB_VALUES]
     return [lp]
 
 
 def generate_sweep_points() -> List[Tuple[int, int, int]]:
     points: List[Tuple[int, int, int]] = []
-    for dp in DP_VALUES:
-        for lp in LP_VALUES:
-            for mb in determine_mb_values(lp):
-                points.append((dp, lp, mb))
+    if SWEEP_MODE == "mb_sweep":
+        dp = MB_SWEEP_DP
+        lp = MB_SWEEP_LP
+        for mb in determine_mb_values(lp):
+            points.append((dp, lp, mb))
+    else:
+        for dp in DP_VALUES:
+            for lp in LP_VALUES:
+                for mb in determine_mb_values(lp):
+                    points.append((dp, lp, mb))
     return points
 
 

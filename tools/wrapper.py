@@ -24,29 +24,43 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 WRAPPER_ROOT = Path(__file__).resolve().parent
 WRAPPER_OUTPUT_ROOT = WRAPPER_ROOT / 'wrapper_outputs'
 DEFAULT_STG_PYTHON = Path('../.venv/bin/python3')
+DEFAULT_MLSYNTH_PYTHON = DEFAULT_STG_PYTHON
+MLSYNTH_ROOT = REPO_ROOT / 'MLSynth'
 
-# Toggle between 'deepflow', 'deepflow_ablation', 'stg', 'simai_analytical', or 'all'.
+# Toggle between 'deepflow', 'deepflow_ablation', 'stg', 'mlsynth', 'simai_analytical', or 'all'.
 RUN_SELECTION = 'all'
 
 GLOBAL_CONFIG: Dict[str, object] = {
-    'hardware_config': REPO_ROOT / 'configs/hardware-config/a100_80GB.yaml',
+    'hardware_config': REPO_ROOT / 'configs/hardware-config/a100_80GB_NEMO.yaml',
     # 'model_config': REPO_ROOT / 'configs/model-config/LLM.yaml',
-    # 'model_config': REPO_ROOT / 'configs/model-config/Llama2-7B.yaml',
-    'model_config': REPO_ROOT / 'configs/model-config/Llama3.1-405B.yaml',
+    'model_config': REPO_ROOT / 'configs/model-config/Llama2-7B.yaml',
+    # 'model_config': REPO_ROOT / 'configs/model-config/Llama3.1-405B.yaml',
     'dry_run': False,
     'generate_visuals': True,
     'isol_astra': True, # force "deepflow" mode to run AstraSim the exact same way as "stg" mode. Set to True for best comparisons.
     # Diagnostic toggles: set to True to neutralize specific kernels so DeepFlow and STG can be compared apples-to-apples.
     # - zero_softmax: convert attention softmax nodes into 1-op/1-byte stubs across all ET bundles.
     # - zero_embedding: do the same for embedding/in_emb/out_emb nodes (helps when STG models embedding as a dense GEMM).
+    # - zero_layernorm_residual: neutralize layernorm/residual pointwise ops for apples-to-apples tests.
+    # - zero_ffn: neutralize FFN GEMMs (forward/backward) to isolate remaining differences.
     'zero_softmax': True,
     'zero_embedding': False,
+    'zero_attention': False,
+    'zero_layernorm_residual': False,
+    'zero_ffn': False,
     'deepflow': {
         'additional_env': {}
     },
     'deepflow_ablation': {},
     'stg': {
         'python': DEFAULT_STG_PYTHON,
+        'double_ffn_backward_bytes': False, # to match DeepFlow's behavior
+    },
+    'mlsynth': {
+        'python': DEFAULT_MLSYNTH_PYTHON,
+        'scale': 1.0,
+        'retain_generator_outputs': False,
+        'additional_env': {},
     },
     'simai_analytical': {
         'run_binary': False,
@@ -55,10 +69,73 @@ GLOBAL_CONFIG: Dict[str, object] = {
 }
 
 TEXT_ONLY_VIZ = True
+
+# Have to be >1 (substantially above 0) else AstraSim will crash. I set them to very small vals.
 _FAKE_DURATION_US = 1
 _FAKE_NUM_OPS = 1_000_000
 _FAKE_TENSOR_SIZE = 1024
+# Substrings used to neutralize attention compute nodes across generators.
+_ATTENTION_NODE_PATTERNS = [
+    "qkv_proj",
+    "attention_score",
+    "attention_output",
+    "output_proj",
+    "mha.",
+    "attn_kernel",
+    "attention_compute"
+]
+# Substrings used to neutralize layernorm + residual pointwise ops across generators.
+_LN_RESIDUAL_PATTERNS = [
+    "pt_layernorm",
+   "pt_residual",
+   "post_attn_norm",
+   "input_norm",
+   "ffn_res",
+   "mha_res",
+]
+# Substrings used to neutralize FFN GEMM ops across generators.
+_FFN_PATTERNS = [
+    "ffn1_",
+    "ffn2_",
+    "ffn.",
+    "ffn_",
+    "ffwd_"
+]
+_SOFTMAX_PATTERNS = [
+    "pt_attention_scale_softmax",
+    "linear_softmax",
+]
 
+
+def _stg_scale_ffn_backward(dest_root: Path, factor: int) -> None:
+    """Scale tensor sizes for STG FFN backward nodes by a constant factor."""
+    if factor == 1:
+        return
+    for et_path in dest_root.glob('workload.*.et'):
+        fh = chakra_open(str(et_path))
+        nodes: List[pb.Node] = []
+        modified = False
+        try:
+            meta = pb.GlobalMetadata()
+            if not chakra_decode(fh, meta):
+                continue
+            while True:
+                node = pb.Node()
+                if not chakra_decode(fh, node):
+                    break
+                if int(node.type) == pb.COMP_NODE and 'ffn.d' in getattr(node, "name", ""):
+                    # print(f"Scaling FFN backward node {node.name} by factor {factor}")
+                    _scale_tensor_sizes(node, factor)
+                    modified = True
+                nodes.append(node)
+        finally:
+            fh.close()
+        if not modified:
+            continue
+        with et_path.open('wb') as out_fh:
+            chakra_encode(out_fh, meta)
+            for node in nodes:
+                write_et_node(out_fh, node)
 
 def ensure_path_exists(path: Path, description: str) -> None:
     if not path.exists():
@@ -68,7 +145,10 @@ def ensure_path_exists(path: Path, description: str) -> None:
 
 def copy_top_level_files(src: Path, dest: Path) -> List[Path]:
     if dest.exists():
-        shutil.rmtree(dest)
+        try:
+            shutil.rmtree(dest)
+        except OSError:
+            pass
     dest.mkdir(parents=True, exist_ok=True)
     copied: List[Path] = []
     for entry in sorted(src.iterdir()):
@@ -118,6 +198,8 @@ def run_deepflow_annotated(config: Dict[str, object]) -> Dict[str, object]:
         env['DEEPFLOW_ASTRA_SKIP_EXEC'] = '1'
     else:
         env.pop('DEEPFLOW_ASTRA_SKIP_EXEC', None)
+    # DEEPFLOW_ASTRA_CACHE_MODE=no_cache
+    env['DEEPFLOW_ASTRA_CACHE_MODE'] = 'no_cache'
     extra_env: Dict[str, object] = {}
     if isinstance(config.get('deepflow'), dict):
         extra_env = config['deepflow'].get('additional_env', {}) or {}
@@ -141,9 +223,16 @@ def run_deepflow_annotated(config: Dict[str, object]) -> Dict[str, object]:
     ensure_path_exists(artifact_src, 'DeepFlow flattened AstraSim artifacts')
     copied_artifacts = copy_top_level_files(artifact_src, dest_root)
     if config.get('zero_softmax'):
-        _zero_named_nodes(dest_root, ["pt_attention_scale_softmax"])
+        _zero_named_nodes(dest_root, _SOFTMAX_PATTERNS)
     if config.get('zero_embedding'):
         _zero_named_nodes(dest_root, ["embedding", "in_emb", "out_emb"])
+    if config.get('zero_attention'):
+        _zero_named_nodes(dest_root, _ATTENTION_NODE_PATTERNS)
+    if config.get('zero_layernorm_residual'):
+        _zero_named_nodes(dest_root, _LN_RESIDUAL_PATTERNS)
+    if config.get('zero_ffn'):
+        _zero_named_nodes(dest_root, _FFN_PATTERNS)
+
 
     summaries = snapshot_summary_files(dest_root)
 
@@ -315,6 +404,63 @@ def _build_manifest(et_files: List[Path], dest_dir: Path) -> Path:
     with manifest_path.open('w', encoding='utf-8') as handle:
         json.dump({'npus': len(et_files), 'ranks': manifest_ranks}, handle, sort_keys=True, separators=(",", ":"))
     return manifest_path
+
+
+def _normalize_comm_groups(dest_root: Path, comm_group_path: Path, mappings: Dict[str, str]) -> Dict[str, str]:
+    if not comm_group_path.exists():
+        return {}
+    with comm_group_path.open('r', encoding='utf-8') as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        return {}
+    changed = False
+    normalized: Dict[str, List[int]] = {}
+    for idx, key in enumerate(sorted(data.keys())):
+        new_key = str(idx+1)
+        normalized[new_key] = data[key]
+        if key != new_key:
+            changed = True
+        mappings[key] = new_key
+    if changed:
+        with comm_group_path.open('w', encoding='utf-8') as handle:
+            json.dump(normalized, handle, indent=2, sort_keys=True)
+    return mappings
+
+
+def _remap_pg_names(dest_root: Path, mapping: Dict[str, str]) -> None:
+    if not mapping:
+        return
+    et_files = list(dest_root.glob('*.et'))
+    for et_path in et_files:
+        fh = chakra_open(str(et_path))
+        nodes: List[pb.Node] = []
+        modified = False
+        try:
+            meta = pb.GlobalMetadata()
+            if not chakra_decode(fh, meta):
+                continue
+            while True:
+                node = pb.Node()
+                if not chakra_decode(fh, node):
+                    break
+                for attr in node.attr:
+                    if attr.name == 'pg_name':
+                        which = attr.WhichOneof('value')
+                        if which:
+                            current = getattr(attr, which)
+                            new_val = mapping.get(str(current))
+                            if new_val is not None and new_val != current:
+                                setattr(attr, which, new_val)
+                                modified = True
+                nodes.append(node)
+        finally:
+            fh.close()
+        if not modified:
+            continue
+        with et_path.open('wb') as out_fh:
+            chakra_encode(out_fh, meta)
+            for node in nodes:
+                write_et_node(out_fh, node)
 
 
 def _scale_comm_attrs(node: pb.Node, scale: int) -> None:
@@ -523,9 +669,10 @@ def run_stg(config: Dict[str, object]) -> Dict[str, object]:
     if effective_pp != lp:
         print(f"[Wrapper] STG pipeline degree {lp} exceeds num_layers {num_layers}; clamping to {effective_pp}")
 
-    stg_cfg = config.get('stg', {}) if isinstance(config.get('stg'), dict) else {}
+    stg_cfg = config['stg']
     python_path = stg_cfg.get('python', DEFAULT_STG_PYTHON)
     python_exe = Path(python_path)
+    stg_double_ffn = stg_cfg['double_ffn_backward_bytes']
     # ensure_path_exists(python_exe, 'STG Python interpreter') # check fails as path is from stg root not this tool root
 
     stg_root = REPO_ROOT / 'symbolic_tensor_graph'
@@ -573,10 +720,18 @@ def run_stg(config: Dict[str, object]) -> Dict[str, object]:
 
     dest_root = WRAPPER_OUTPUT_ROOT / 'stg'
     copied_artifacts = copy_top_level_files(staging_dir, dest_root)
+    if stg_double_ffn:
+        _stg_scale_ffn_backward(dest_root, 2)
     if config.get('zero_softmax'):
-        _zero_named_nodes(dest_root, ["pt_attention_scale_softmax"])
+        _zero_named_nodes(dest_root, _SOFTMAX_PATTERNS)
     if config.get('zero_embedding'):
         _zero_named_nodes(dest_root, ["embedding", "in_emb", "out_emb"])
+    if config.get('zero_attention'):
+        _zero_named_nodes(dest_root, _ATTENTION_NODE_PATTERNS)
+    if config.get('zero_layernorm_residual'):
+        _zero_named_nodes(dest_root, _LN_RESIDUAL_PATTERNS)
+    if config.get('zero_ffn'):
+        _zero_named_nodes(dest_root, _FFN_PATTERNS)
 
     generate_visuals = bool(config.get('generate_visuals', False))
     if generate_visuals:
@@ -642,6 +797,266 @@ def run_stg(config: Dict[str, object]) -> Dict[str, object]:
         'astrasim_per_rank': per_rank,
     }
 
+
+def _build_mlsynth_config(
+    hw_data: Dict[str, object],
+    model_data: Dict[str, object],
+    sched: Dict[str, object],
+    scale: float,
+) -> tuple[Dict[str, object], Dict[str, int]]:
+    sw_param = hw_data.get('sw_param', {}) or {}
+    precision = sw_param.get('precision', 1)
+    try:
+        precision = int(float(precision))
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid precision value in hardware config: {precision}") from None
+
+    dp = int(sched['dp'])
+    lp = int(sched['lp'])
+    kp1 = int(sched.get('kp1', 1))
+    kp2 = int(sched.get('kp2', 1))
+    tp = max(1, kp1 * kp2)
+    mb = int(sched['mb'])
+    if mb <= 0:
+        raise ValueError('MLSynth: micro-batches (mb) must be positive')
+
+    model_param = model_data.get('model_param', {}) or {}
+    global_batch_size = int(model_param['batch_size'])
+    seq_len = int(model_param['seq_len'])
+    hidden_dim = int(model_param['hidden_dim'])
+    num_layers = int(model_param['num_layers'])
+    vocab_size = int(model_param['vocab_size'])
+    attention_cfg = model_param.get('attention') or {}
+    num_heads = int(attention_cfg.get('num_heads', 0) or 0)
+    kv_heads = int(attention_cfg.get('kv_heads', num_heads) or num_heads)
+
+    if dp > global_batch_size:
+        raise ValueError(f"MLSynth: dp ({dp}) cannot exceed batch_size ({global_batch_size})")
+
+    if global_batch_size % dp != 0:
+        raise ValueError(
+            f"MLSynth: batch_size ({global_batch_size}) must be divisible by dp ({dp})"
+        )
+
+    batch_size = global_batch_size // dp
+    if batch_size < mb:
+        raise ValueError(
+            f"MLSynth: per-rank batch ({batch_size}) must be >= microbatches ({mb})"
+        )
+
+    effective_pp = min(lp, num_layers)
+    if effective_pp != lp:
+        print(f"[Wrapper] MLSynth pipeline degree {lp} exceeds num_layers {num_layers}; clamping to {effective_pp}")
+    if num_layers % max(1, effective_pp) != 0:
+        raise ValueError(
+            f"MLSynth requires num_layers ({num_layers}) to be divisible by pipeline stages ({effective_pp})."
+        )
+
+    cfg = {
+        'model': {
+            'name': str(model_param.get('model_name', 'transformer')),
+            'num_layers': num_layers,
+            'sequence_len': seq_len,
+            'vocab_size': vocab_size,
+            'hidden_size': hidden_dim,
+            'batch_size': batch_size,
+            'num_microbatches': mb,
+            'bytes_per_val': precision,
+            'scale': float(scale),
+            'num_heads': num_heads,
+            'kv_heads': kv_heads,
+        },
+        'parallelism': {
+            'dp_size': dp,
+            'pp_size': effective_pp,
+            'tp_size': tp,
+        },
+    }
+    return cfg, {
+        'dp': dp,
+        'pp': effective_pp,
+        'tp': tp,
+        'mb': mb,
+        'global_batch_size': global_batch_size,
+        'per_rank_batch_size': batch_size,
+        'num_heads': num_heads,
+        'kv_heads': kv_heads,
+    }
+
+
+def run_mlsynth(config: Dict[str, object]) -> Dict[str, object]:
+    hardware_cfg = Path(config['hardware_config'])
+    model_cfg = Path(config['model_config'])
+    ensure_path_exists(hardware_cfg, 'hardware config')
+    ensure_path_exists(model_cfg, 'model config')
+
+    hw_data = _load_yaml(hardware_cfg)
+    model_data = _load_yaml(model_cfg)
+    sched = hw_data.get('scheduling_param', {}) or {}
+    if not sched:
+        raise ValueError('MLSynth requires scheduling_param in hardware config')
+
+    mlsynth_cfg = config.get('mlsynth', {}) if isinstance(config.get('mlsynth'), dict) else {}
+    scale = float(mlsynth_cfg.get('scale', 1.0))
+    retain_outputs = bool(mlsynth_cfg.get('retain_generator_outputs', False))
+
+    cfg_payload, derived = _build_mlsynth_config(hw_data, model_data, sched, scale)
+
+    staging_dir = MLSYNTH_ROOT / 'wrapper_tmp'
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir)
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    config_path = staging_dir / 'wrapper_input.yaml'
+    with config_path.open('w', encoding='utf-8') as handle:
+        yaml.safe_dump(cfg_payload, handle, sort_keys=False)
+
+    python_path = mlsynth_cfg.get('python', DEFAULT_MLSYNTH_PYTHON)
+    python_exe = Path(python_path)
+    env = os.environ.copy()
+    chakra_pb = REPO_ROOT / 'astra-sim' / 'extern' / 'graph_frontend' / 'chakra' / 'schema' / 'protobuf'
+    chakra_utils = REPO_ROOT / 'astra-sim' / 'extern' / 'graph_frontend' / 'chakra' / 'src' / 'third_party' / 'utils'
+    py_paths = [str(chakra_pb), str(chakra_utils)]
+    existing_py_path = env.get('PYTHONPATH')
+    if existing_py_path:
+        py_paths.append(existing_py_path)
+    env['PYTHONPATH'] = os.pathsep.join(py_paths)
+    additional_env = mlsynth_cfg.get('additional_env') or {}
+    for key, value in additional_env.items():
+        env[str(key)] = str(value)
+
+    cmd = [str(python_exe), 'synthesise_workload.py', '-c', str(config_path)]
+    print(f"[Wrapper] MLSynth command: {' '.join(cmd)}")
+    start_time = time.perf_counter()
+    result = subprocess.run(cmd, cwd=MLSYNTH_ROOT, env=env, check=False, stdout=sys.stdout, stderr=sys.stderr)
+    duration = time.perf_counter() - start_time
+    if result.returncode != 0:
+        raise RuntimeError(f"MLSynth generator failed with return code {result.returncode}")
+
+    name = (
+        f"{cfg_payload['model']['name']}"
+        f"_{cfg_payload['parallelism']['dp_size']}dp"
+        f"_{cfg_payload['parallelism']['pp_size']}pp"
+        f"_{cfg_payload['parallelism']['tp_size']}tp"
+        f"_{cfg_payload['model']['batch_size']}B"
+        f"_{cfg_payload['model']['sequence_len']}S"
+        f"_{cfg_payload['model']['vocab_size']}V"
+        f"_{cfg_payload['model']['hidden_size']}d"
+        f"_{cfg_payload['model']['bytes_per_val']}b"
+        f"_{int(cfg_payload['model']['scale'] * 100)}scale"
+    )
+    output_dir = MLSYNTH_ROOT / 'output' / name
+    ensure_path_exists(output_dir, 'MLSynth output directory')
+    et_dir = output_dir / 'et'
+    ensure_path_exists(et_dir, 'MLSynth ET directory')
+
+    dest_root = WRAPPER_OUTPUT_ROOT / 'mlsynth'
+    if dest_root.exists():
+        shutil.rmtree(dest_root)
+    dest_root.mkdir(parents=True, exist_ok=True)
+
+    copied_artifacts: List[Path] = []
+    group_mapping: Dict[str, str] = {}
+    for path in sorted(et_dir.glob('*.et')):
+        target = dest_root / path.name
+        shutil.copy2(path, target)
+        copied_artifacts.append(target)
+    comm_groups_path = output_dir / 'comm_groups.json'
+    if comm_groups_path.exists():
+        target = dest_root / comm_groups_path.name
+        shutil.copy2(comm_groups_path, target)
+        copied_artifacts.append(target)
+        group_mapping = _normalize_comm_groups(dest_root, target, {})
+        if group_mapping:
+            _remap_pg_names(dest_root, group_mapping)
+
+    if not retain_outputs:
+        try:
+            shutil.rmtree(output_dir)
+        except OSError:
+            pass
+        try:
+            shutil.rmtree(staging_dir)
+        except OSError:
+            pass
+    if config.get('zero_softmax'):
+        _zero_named_nodes(dest_root, _SOFTMAX_PATTERNS)
+    if config.get('zero_embedding'):
+        _zero_named_nodes(dest_root, ["embedding", "in_emb", "out_emb"])
+    if config.get('zero_attention'):
+        _zero_named_nodes(dest_root, _ATTENTION_NODE_PATTERNS)
+    if config.get('zero_layernorm_residual'):
+        _zero_named_nodes(dest_root, _LN_RESIDUAL_PATTERNS)
+    if config.get('zero_ffn'):
+        _zero_named_nodes(dest_root, _FFN_PATTERNS)
+
+    generate_visuals = bool(config.get('generate_visuals', False))
+    if generate_visuals:
+        vis_targets = [str(p) for p in sorted(dest_root.glob('*.et'))[:10]]
+        if vis_targets:
+            from astrasim_lib.executor import _dump_et_text  # type: ignore
+            from astrasim_lib import stg_viz  # type: ignore
+            render_dir = dest_root
+            if not TEXT_ONLY_VIZ:
+                stg_viz.render_stg_bundle(vis_targets, render_dir)
+            _dump_et_text(vis_targets)
+
+    dry_run = bool(config.get('dry_run', False))
+    manifest_path: Path | None = None
+    per_rank: List[float] = []
+    total_time = None
+    if dry_run:
+        print('[Wrapper] MLSynth dry_run set; skipping AstraSim execution.')
+    else:
+        et_files = sorted(dest_root.glob('*.et'))
+        if not et_files:
+            raise RuntimeError('MLSynth: no ET files found after generation')
+        manifest_path = _build_manifest(et_files, dest_root)
+        hw_obj = _load_hw_config_object(hardware_cfg)
+        astra_config_dir = dest_root / 'astrasim_configs'
+        astra_config_dir.mkdir(parents=True, exist_ok=True)
+        reset_json_cache()
+        generate_astrasim_configs_from_hw(
+            hw_obj,
+            out_dir=str(astra_config_dir),
+            npus_count=len(et_files),
+            roofline_enabled=True,
+        )
+        cache_path = astra_config_dir / 'cache.json'
+        comm_group_json = dest_root / 'comm_groups.json'
+        per_rank, total_time = run_cache_astrasim(
+            hw_obj,
+            comm='graph',
+            npus_count=len(et_files),
+            size_bytes=0,
+            astra_config_dir=str(astra_config_dir),
+            cache_path=str(cache_path),
+            manifest_json_path=str(manifest_path),
+            workload_prefix=str(dest_root / name),
+            comm_group_json=str(comm_group_json) if comm_group_json.exists() else None,
+        )
+        print(f"[Wrapper] MLSynth AstraSim total: {total_time:.6f} s")
+
+    if derived['num_heads'] and derived['kv_heads'] and derived['kv_heads'] != derived['num_heads']:
+        print(' ------------------------------------------------------------------------------------------------ ')
+        print('\n!!! WARNING !!! MLSynth does not support GQA (kv_heads != num_heads). Results may be inaccurate.\n')
+        print(' ------------------------------------------------------------------------------------------------ ')
+
+    print(f"[Wrapper] MLSynth generator finished in {duration:.2f} s; artifacts at {dest_root}")
+    for path in copied_artifacts:
+        print(f"    • {path.name}")
+
+    return {
+        'mode': 'mlsynth',
+        'duration_seconds': duration,
+        'artifact_dir': dest_root,
+        'summaries': [],
+        'dry_run': dry_run,
+        'manifest': manifest_path,
+        'astrasim_total_time': total_time,
+        'astrasim_per_rank': per_rank,
+    }
+
+
 def run_deepflow_ablation(config: Dict[str, object]) -> Dict[str, object]:
     """Run DeepFlow to generate ETs with metadata, then execute AstraSim in roofline mode."""
     hardware_cfg = Path(config['hardware_config'])
@@ -689,9 +1104,16 @@ def run_deepflow_ablation(config: Dict[str, object]) -> Dict[str, object]:
     ensure_path_exists(artifact_src, 'DeepFlow flattened AstraSim artifacts')
     copied_artifacts = copy_top_level_files(artifact_src, dest_root)
     if config.get('zero_softmax'):
-        _zero_named_nodes(dest_root, ["pt_attention_scale_softmax"])
+        _zero_named_nodes(dest_root, _SOFTMAX_PATTERNS)
     if config.get('zero_embedding'):
         _zero_named_nodes(dest_root, ["embedding", "in_emb", "out_emb"])
+    if config.get('zero_attention'):
+        _zero_named_nodes(dest_root, _ATTENTION_NODE_PATTERNS)
+    if config.get('zero_layernorm_residual'):
+        _zero_named_nodes(dest_root, _LN_RESIDUAL_PATTERNS)
+    if config.get('zero_ffn'):
+        _zero_named_nodes(dest_root, _FFN_PATTERNS)
+
 
     summaries = snapshot_summary_files(dest_root)
 
@@ -827,6 +1249,7 @@ def dispatch(selection: str, config: Dict[str, object]) -> List[Dict[str, object
         'deepflow': run_deepflow_annotated,
         'deepflow_ablation': run_deepflow_ablation,
         'stg': run_stg,
+        'mlsynth': run_mlsynth,
         'simai_analytical': run_simai_analytical,
     }
 
@@ -836,6 +1259,7 @@ def dispatch(selection: str, config: Dict[str, object]) -> List[Dict[str, object
             'deepflow',
             'deepflow_ablation',
             'stg',
+            'mlsynth',
             # 'simai_analytical',
         ]
         for key in mode_ls:

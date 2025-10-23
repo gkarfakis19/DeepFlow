@@ -41,3 +41,4 @@ astra-sim_og/
 *.et
 tools/wrapper_outputs/
 paper_primer.md
+configs/hardware-config/__wrapper_sweep_tmp/*

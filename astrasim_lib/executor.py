@@ -22,7 +22,7 @@ from collections import defaultdict, deque
 from itertools import count as _it_count
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-sys.setrecursionlimit(10000)
+sys.setrecursionlimit(50000)
 
 import graphviz_async
 from graphviz import Digraph

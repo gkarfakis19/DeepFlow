@@ -327,8 +327,11 @@ def run_cache_astrasim(
         cache_path = os.path.join(override_dir, "cache.json")
 
     cache_mode = _cache_mode()
-    allow_read = cache_mode in {"CACHE_READONLY", "CACHE_READWRITE"}
-    allow_write = cache_mode == "CACHE_READWRITE"
+    # allow_read = cache_mode in {"CACHE_READONLY", "CACHE_READWRITE"}
+    # allow_write = cache_mode == "CACHE_READWRITE"
+
+    allow_read = False
+    allow_write = False
 
     if allow_read or allow_write:
         ensure_cache_file_exists(cache_path)
