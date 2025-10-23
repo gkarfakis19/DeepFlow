@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import math
 import os
 from dataclasses import dataclass
@@ -96,6 +94,8 @@ class PipelineGraphFlattener:
                     obj.duration,
                     fwd=obj.fwd,
                     is_kv_cache=getattr(obj, "is_kv_cache", False),
+                    flops=getattr(obj, "flops", 0),
+                    tensor_bytes=getattr(obj, "tensor_bytes", 0),
                 )
             else:
                 cloned = simulate_LLM.Node(
@@ -105,6 +105,8 @@ class PipelineGraphFlattener:
                     obj.duration,
                     fwd=obj.fwd,
                     is_kv_cache=getattr(obj, "is_kv_cache", False),
+                    flops=getattr(obj, "flops", 0),
+                    tensor_bytes=getattr(obj, "tensor_bytes", 0),
                 )
 
             self._clone_cache[obj_id] = cloned
@@ -195,6 +197,8 @@ class PipelineGraphFlattener:
                     hw_id=hw_id,
                     duration=duration,
                     fwd=(direction == "forward"),
+                    flops=cfg.get("flops", 0),
+                    tensor_bytes=cfg.get("bytes", 0),
                 )
                 gemm_node.stage_id = stage_id
                 gemm_node.tp_rank = tp_rank
@@ -364,6 +368,8 @@ class PipelineGraphFlattener:
             "stage_id",
             "tp_rank",
             "is_kv_cache",
+            "flops",
+            "tensor_bytes",
         ):
             if hasattr(source, attr):
                 setattr(target, attr, getattr(source, attr))

@@ -200,6 +200,11 @@ class TimeCalculationLLM(TimeCalculation):
         self.tied_embeddings = getattr(self.model, "tied_embeddings", True)
         self.memory_capacity_exceeded = False
         self.memory_capacity_violation_gb = 0.0
+        annotate_env = os.environ.get("DEEPFLOW_ANNOTATE_COMPUTE")
+        self.annotate_compute = True if annotate_env is None else _env_flag("DEEPFLOW_ANNOTATE_COMPUTE")
+        self.dtype_size = int(self.precision) if self.precision else 2
+        if self.dtype_size <= 0:
+            self.dtype_size = 2
         self.pipeline_graph: Optional[Graph] = None
         self.pipeline_root: Optional[Any] = None
         self.pipeline_interconnect: Optional[Dict[str, Tuple[float, float]]] = None
@@ -859,9 +864,29 @@ class TimeCalculationLLM(TimeCalculation):
                     int(softmax_flop / 1e9), int(softmax_mem / 1e9)
                 )
             )
-            print("Softmax (b) time: {:,}\n".format(softmax_time))
+        print("Softmax (b) time: {:,}\n".format(softmax_time))
 
         return scale_time + softmax_time
+    
+    def _compute_gemm_flops_bytes(self, gemm_shape: Tuple[int, ...], dtype_size: Optional[int] = None) -> Tuple[int, int, int, int]:
+        """Return (forward_flops, backward_flops, input_bytes, output_bytes) for ``gemm_shape``."""
+        if dtype_size is None:
+            dtype_size = self.dtype_size
+        if not gemm_shape:
+            return 0, 0, 0, 0
+        if len(gemm_shape) == 3:
+            M, K, N = gemm_shape
+            batch = 1
+        elif len(gemm_shape) == 4:
+            batch, M, K, N = gemm_shape
+        else:
+            raise ValueError(f"Unexpected GEMM shape dimensions: {len(gemm_shape)}")
+
+        forward_flops = 2 * batch * M * K * N
+        backward_flops = 2 * batch * (2 * M * N * K)  # grad_act + grad_wt
+        input_bytes = batch * (M * K + K * N) * dtype_size
+        output_bytes = batch * M * N * dtype_size
+        return forward_flops, backward_flops, input_bytes, output_bytes
         
     def get_residual_f(self, tensor_shape):
         # Residual operates on full tensor, not just GEMM output dimension
@@ -1198,9 +1223,14 @@ class TimeCalculationLLM(TimeCalculation):
     # we need a significant refactor here. The comm sizes are ingested in a weird way and never used. Instead we use old precomputed sizes.
     # FIX at some point!
     def compute_all_gemm_and_node_times(self, batch_size, vocab_size, hidden_dim, seq_len, num_heads, kv_heads, ffn_dim):
-        """Compute latency for all GEMM operations and node breakdown times in one function."""
+        """Compute latency and metadata for all transformer sub-operations."""
 
-        # Process GEMM shapes
+        annotate = self.annotate_compute
+        dtype_size = self.dtype_size
+
+        def _time(val: float) -> float:
+            return val if annotate else 0.0
+
         gemm_shapes = LLM_util.process_gemm_shapes(
             self, batch_size, seq_len, hidden_dim, num_heads, kv_heads, ffn_dim, vocab_size
         )
@@ -1219,6 +1249,7 @@ class TimeCalculationLLM(TimeCalculation):
                 "ffn_dim:",
                 ffn_dim,
             )
+
         gemm_qkv_proj = gemm_shapes["qkv_proj"]
         gemm_attention_score = gemm_shapes["attention_score"]
         gemm_attention_output = gemm_shapes["attention_output"]
@@ -1227,205 +1258,717 @@ class TimeCalculationLLM(TimeCalculation):
         gemm_ffn2 = gemm_shapes["ffn2"]
         gemm_linear = gemm_shapes["linear"]
 
-        # Compute GEMM times and organize in structured dict
-        transformer_results = {}
+        gemm_results: Dict[str, Dict[str, Any]] = {}
+        transformer_results: Dict[str, Dict[str, Any]] = {}
 
+        # QKV projection
+        qkv_proj_gemm_f, qkv_proj_reduction_f, qkv_proj_size_f = self.parallelism_gemm_forward(
+            gemm_qkv_proj, "qkv_projection_f", gemm_type=GemmType.QKV
+        )
+        qkv_proj_gemm_b, qkv_proj_reduction_b, qkv_proj_size_b = self.parallelism_gemm_backward(
+            gemm_qkv_proj, "qkv_projection_b", gemm_type=GemmType.QKV
+        )
+        qkv_proj_f_raw = qkv_proj_gemm_f + qkv_proj_reduction_f
+        qkv_proj_b_raw = qkv_proj_gemm_b + qkv_proj_reduction_b
+        qkv_f_flops, qkv_b_flops, qkv_in_bytes, qkv_out_bytes = self._compute_gemm_flops_bytes(gemm_qkv_proj)
 
-        # QKV Projection GEMM
-        qkv_proj_gemm_f,  qkv_proj_reduction_f, qkv_proj_size_f = self.parallelism_gemm_forward(gemm_qkv_proj, "qkv_projection_f", gemm_type=GemmType.QKV)
-        qkv_proj_gemm_b,  qkv_proj_reduction_b, qkv_proj_size_b = self.parallelism_gemm_backward(gemm_qkv_proj, "qkv_projection_b", gemm_type=GemmType.QKV)
-        qkv_proj_f = qkv_proj_gemm_f + qkv_proj_reduction_f
-        qkv_proj_b = qkv_proj_gemm_b + qkv_proj_reduction_b
+        gemm_results['qkv_proj'] = {
+            'forward': qkv_proj_f_raw,
+            'backward': qkv_proj_b_raw,
+            'forward_gemm': qkv_proj_gemm_f,
+            'forward_reduction': qkv_proj_reduction_f,
+            'backward_gemm': qkv_proj_gemm_b,
+            'backward_reduction': qkv_proj_reduction_b,
+            'flops': qkv_f_flops,
+            'flops_backward': qkv_b_flops,
+            'input_bytes': qkv_in_bytes,
+            'output_bytes': qkv_out_bytes,
+            'input_bytes_backward': qkv_in_bytes,
+            'output_bytes_backward': qkv_out_bytes,
+            'comm_size_forward': qkv_proj_size_f,
+            'comm_size_backward': qkv_proj_size_b,
+        }
         transformer_results['qkv_proj'] = {
-            'forward': qkv_proj_f, 'backward': qkv_proj_b,
-            'forward_gemm': qkv_proj_gemm_f, 'forward_reduction': qkv_proj_reduction_f,
-            'backward_gemm': qkv_proj_gemm_b, 'backward_reduction': qkv_proj_reduction_b,
-            'comm_size_forward': qkv_proj_size_f, 'comm_size_backward': qkv_proj_size_b
+            'forward': _time(qkv_proj_f_raw),
+            'backward': _time(qkv_proj_b_raw),
+            'forward_gemm': _time(qkv_proj_gemm_f),
+            'forward_reduction': _time(qkv_proj_reduction_f),
+            'backward_gemm': _time(qkv_proj_gemm_b),
+            'backward_reduction': _time(qkv_proj_reduction_b),
+            'comm_size_forward': qkv_proj_size_f,
+            'comm_size_backward': qkv_proj_size_b,
+            'flops': qkv_f_flops,
+            'flops_backward': qkv_b_flops,
+            'input_bytes': qkv_in_bytes,
+            'output_bytes': qkv_out_bytes,
+            'input_bytes_backward': qkv_in_bytes,
+            'output_bytes_backward': qkv_out_bytes,
         }
-        if self.flash_attention is False:
-            # Attention Score GEMM
-            attn_score_gemm_f,  attn_score_reduction_f, attn_score_size_f = self.parallelism_gemm_forward(gemm_attention_score, "attention_score_f", gemm_type=GemmType.ATTENTION_SCORE)
-            attn_score_gemm_b,  attn_score_reduction_b, attn_score_size_b = self.parallelism_gemm_backward(gemm_attention_score, "attention_score_b", gemm_type=GemmType.ATTENTION_SCORE)
-            attention_score_f = attn_score_gemm_f + attn_score_reduction_f
-            attention_score_b = attn_score_gemm_b + attn_score_reduction_b
+
+        attention_size_f_raw = 0
+        attention_size_b_raw = 0
+        attention_reduction_f_raw = 0.0
+        attention_reduction_b_raw = 0.0
+        attention_gemm_f_raw = 0.0
+        attention_gemm_b_raw = 0.0
+        attention_f_raw = 0.0
+        attention_b_raw = 0.0
+
+        if not self.flash_attention:
+            attn_score_gemm_f, attn_score_reduction_f, attn_score_size_f = self.parallelism_gemm_forward(
+                gemm_attention_score, "attention_score_f", gemm_type=GemmType.ATTENTION_SCORE
+            )
+            attn_score_gemm_b, attn_score_reduction_b, attn_score_size_b = self.parallelism_gemm_backward(
+                gemm_attention_score, "attention_score_b", gemm_type=GemmType.ATTENTION_SCORE
+            )
+            attention_score_f_raw = attn_score_gemm_f + attn_score_reduction_f
+            attention_score_b_raw = attn_score_gemm_b + attn_score_reduction_b
+            attn_score_f_flops, attn_score_b_flops, attn_score_in_bytes, attn_score_out_bytes = self._compute_gemm_flops_bytes(gemm_attention_score)
+
+            gemm_results['attention_score'] = {
+                'forward': attention_score_f_raw,
+                'backward': attention_score_b_raw,
+                'forward_gemm': attn_score_gemm_f,
+                'forward_reduction': attn_score_reduction_f,
+                'backward_gemm': attn_score_gemm_b,
+                'backward_reduction': attn_score_reduction_b,
+                'flops': attn_score_f_flops,
+                'flops_backward': attn_score_b_flops,
+                'input_bytes': attn_score_in_bytes,
+                'output_bytes': attn_score_out_bytes,
+                'input_bytes_backward': attn_score_in_bytes,
+                'output_bytes_backward': attn_score_out_bytes,
+                'comm_size_forward': attn_score_size_f,
+                'comm_size_backward': attn_score_size_b,
+            }
             transformer_results['attention_score'] = {
-                'forward': attention_score_f, 'backward': attention_score_b,
-                'forward_gemm': attn_score_gemm_f, 'forward_reduction': attn_score_reduction_f,
-                'backward_gemm': attn_score_gemm_b, 'backward_reduction': attn_score_reduction_b,
-                'comm_size_forward': attn_score_size_f, 'comm_size_backward': attn_score_size_b
-                
+                'forward': _time(attention_score_f_raw),
+                'backward': _time(attention_score_b_raw),
+                'forward_gemm': _time(attn_score_gemm_f),
+                'forward_reduction': _time(attn_score_reduction_f),
+                'backward_gemm': _time(attn_score_gemm_b),
+                'backward_reduction': _time(attn_score_reduction_b),
+                'comm_size_forward': attn_score_size_f,
+                'comm_size_backward': attn_score_size_b,
+                'flops': attn_score_f_flops,
+                'flops_backward': attn_score_b_flops,
+                'input_bytes': attn_score_in_bytes,
+                'output_bytes': attn_score_out_bytes,
+                'input_bytes_backward': attn_score_in_bytes,
+                'output_bytes_backward': attn_score_out_bytes,
             }
-            attention_scale_softmax_f = self.get_scale_softmax_f(gemm=gemm_attention_score)
-            attention_scale_softmax_b = self.get_scale_softmax_b(gemm=gemm_attention_score)
-            transformer_results['attention_scale_softmax'] = {'forward': attention_scale_softmax_f, 'backward': attention_scale_softmax_b}
 
-            # Attention Output GEMM
-            attn_out_gemm_f,  attn_out_reduction_f, attn_out_size_f = self.parallelism_gemm_forward(gemm_attention_output, "attention_output_f", gemm_type=GemmType.ATTENTION_OUTPUT)
-            attn_out_gemm_b,  attn_out_reduction_b, attn_out_size_b = self.parallelism_gemm_backward(gemm_attention_output, "attention_output_b", gemm_type=GemmType.ATTENTION_OUTPUT)
-            attention_output_f = attn_out_gemm_f + attn_out_reduction_f
-            attention_output_b = attn_out_gemm_b + attn_out_reduction_b
+            attn_out_gemm_f, attn_out_reduction_f, attn_out_size_f = self.parallelism_gemm_forward(
+                gemm_attention_output, "attention_output_f", gemm_type=GemmType.ATTENTION_OUTPUT
+            )
+            attn_out_gemm_b, attn_out_reduction_b, attn_out_size_b = self.parallelism_gemm_backward(
+                gemm_attention_output, "attention_output_b", gemm_type=GemmType.ATTENTION_OUTPUT
+            )
+            attention_output_f_raw = attn_out_gemm_f + attn_out_reduction_f
+            attention_output_b_raw = attn_out_gemm_b + attn_out_reduction_b
+            attn_out_f_flops, attn_out_b_flops, attn_out_in_bytes, attn_out_out_bytes = self._compute_gemm_flops_bytes(gemm_attention_output)
+
+            gemm_results['attention_output'] = {
+                'forward': attention_output_f_raw,
+                'backward': attention_output_b_raw,
+                'forward_gemm': attn_out_gemm_f,
+                'forward_reduction': attn_out_reduction_f,
+                'backward_gemm': attn_out_gemm_b,
+                'backward_reduction': attn_out_reduction_b,
+                'flops': attn_out_f_flops,
+                'flops_backward': attn_out_b_flops,
+                'input_bytes': attn_out_in_bytes,
+                'output_bytes': attn_out_out_bytes,
+                'input_bytes_backward': attn_out_in_bytes,
+                'output_bytes_backward': attn_out_out_bytes,
+                'comm_size_forward': attn_out_size_f,
+                'comm_size_backward': attn_out_size_b,
+            }
             transformer_results['attention_output'] = {
-                'forward': attention_output_f, 'backward': attention_output_b,
-                'forward_gemm': attn_out_gemm_f, 'forward_reduction': attn_out_reduction_f,
-                'backward_gemm': attn_out_gemm_b, 'backward_reduction': attn_out_reduction_b,
-                'comm_size_forward': attn_out_size_f, 'comm_size_backward': attn_out_size_b
+                'forward': _time(attention_output_f_raw),
+                'backward': _time(attention_output_b_raw),
+                'forward_gemm': _time(attn_out_gemm_f),
+                'forward_reduction': _time(attn_out_reduction_f),
+                'backward_gemm': _time(attn_out_gemm_b),
+                'backward_reduction': _time(attn_out_reduction_b),
+                'comm_size_forward': attn_out_size_f,
+                'comm_size_backward': attn_out_size_b,
+                'flops': attn_out_f_flops,
+                'flops_backward': attn_out_b_flops,
+                'input_bytes': attn_out_in_bytes,
+                'output_bytes': attn_out_out_bytes,
+                'input_bytes_backward': attn_out_in_bytes,
+                'output_bytes_backward': attn_out_out_bytes,
             }
-            attention_f = attention_score_f + attention_scale_softmax_f + attention_output_f
-            attention_b = attention_score_b + attention_scale_softmax_b + attention_output_b
-            attention_gemm_f = attn_score_gemm_f + attn_out_gemm_f + attention_scale_softmax_f
-            attention_reduction_f = attn_score_reduction_f + attn_out_reduction_f
-            attention_gemm_b = attn_score_gemm_b + attn_out_gemm_b + attention_scale_softmax_b
-            attention_reduction_b = attn_score_reduction_b + attn_out_reduction_b
-            attention_size_f = attn_score_size_f + attn_out_size_f
-            attention_size_b = attn_score_size_b + attn_out_size_b
-            transformer_results["attention"] = {
-                'forward': attention_f,
-                'backward': attention_b,
-                "forward_gemm": attention_gemm_f,
-                "forward_reduction": attention_reduction_f,
-                "backward_gemm": attention_gemm_b,
-                "backward_reduction": attention_reduction_b,
-                "comm_size_forward": attention_size_f,
-                "comm_size_backward": attention_size_b
-            }
-        elif self.flash_attention is True:
-            attention_f, attention_gemm_f, attention_reduction_f, attention_size_f = self.flash_attention_kernel_forward(attn_score_gemm=gemm_attention_score, attn_out_gemm=gemm_attention_output)
-            attention_b, attention_gemm_b, attention_reduction_b, attention_size_b = 2 * attention_f, 2 * attention_gemm_f, 2 * attention_reduction_f, 2 * attention_size_f
-            transformer_results['attention'] = {
-                'forward': attention_f, 'backward': attention_b,
-                'forward_gemm': attention_gemm_f, 'forward_reduction': attention_reduction_f,
-                'backward_gemm': attention_gemm_b, 'backward_reduction': attention_reduction_b,
-                'comm_size_forward': attention_size_f, 'comm_size_backward': attention_size_b
-            }
-            
 
+            attention_scale_softmax_f_raw = self.get_scale_softmax_f(gemm_attention_score)
+            attention_scale_softmax_b_raw = self.get_scale_softmax_b(gemm_attention_score)
+            softmax_elems = batch_size * num_heads * seq_len * seq_len
+            softmax_f_flops = 6 * softmax_elems
+            softmax_b_flops = 7 * softmax_elems
+            softmax_f_bytes_total = dtype_size * softmax_elems * 11
+            softmax_b_bytes_total = dtype_size * softmax_elems * 13
+            gemm_results['attention_scale_softmax'] = {
+                'forward': attention_scale_softmax_f_raw,
+                'backward': attention_scale_softmax_b_raw,
+                'flops': softmax_f_flops,
+                'flops_backward': softmax_b_flops,
+                'input_bytes': softmax_f_bytes_total // 2,
+                'output_bytes': softmax_f_bytes_total // 2,
+                'input_bytes_backward': softmax_b_bytes_total // 2,
+                'output_bytes_backward': softmax_b_bytes_total // 2,
+                'comm_size_forward': 0,
+                'comm_size_backward': 0,
+            }
+            transformer_results['attention_scale_softmax'] = {
+                'forward': _time(attention_scale_softmax_f_raw),
+                'backward': _time(attention_scale_softmax_b_raw),
+                'forward_gemm': _time(attention_scale_softmax_f_raw),
+                'forward_reduction': 0.0,
+                'backward_gemm': _time(attention_scale_softmax_b_raw),
+                'backward_reduction': 0.0,
+                'comm_size_forward': 0,
+                'comm_size_backward': 0,
+                'flops': softmax_f_flops,
+                'flops_backward': softmax_b_flops,
+                'input_bytes': softmax_f_bytes_total // 2,
+                'output_bytes': softmax_f_bytes_total // 2,
+                'input_bytes_backward': softmax_b_bytes_total // 2,
+                'output_bytes_backward': softmax_b_bytes_total // 2,
+            }
+
+            attention_f_raw = attention_score_f_raw + attention_scale_softmax_f_raw + attention_output_f_raw
+            attention_b_raw = attention_score_b_raw + attention_scale_softmax_b_raw + attention_output_b_raw
+            attention_gemm_f_raw = attn_score_gemm_f + attn_out_gemm_f + attention_scale_softmax_f_raw
+            attention_gemm_b_raw = attn_score_gemm_b + attn_out_gemm_b + attention_scale_softmax_b_raw
+            attention_reduction_f_raw = attn_score_reduction_f + attn_out_reduction_f
+            attention_reduction_b_raw = attn_score_reduction_b + attn_out_reduction_b
+            attention_size_f_raw = attn_score_size_f + attn_out_size_f
+            attention_size_b_raw = attn_score_size_b + attn_out_size_b
+
+            attention_flops = (
+                attn_score_f_flops + attn_out_f_flops + softmax_f_flops
+            )
+            attention_flops_bwd = (
+                attn_score_b_flops + attn_out_b_flops + softmax_b_flops
+            )
+            attention_bytes_f = (
+                attn_score_in_bytes + attn_score_out_bytes +
+                attn_out_in_bytes + attn_out_out_bytes +
+                softmax_f_bytes_total
+            )
+            attention_bytes_b = (
+                attn_score_in_bytes + attn_score_out_bytes +
+                attn_out_in_bytes + attn_out_out_bytes +
+                softmax_b_bytes_total
+            )
         else:
-            raise ValueError("flash_attention should be either True or False")
+            attention_f_raw, attention_gemm_f_raw, attention_reduction_f_raw, attention_size_f_raw = self.flash_attention_kernel_forward(
+                attn_score_gemm=gemm_attention_score, attn_out_gemm=gemm_attention_output
+            )
+            attention_b_raw = 2 * attention_f_raw
+            attention_gemm_b_raw = 2 * attention_gemm_f_raw
+            attention_reduction_b_raw = 2 * attention_reduction_f_raw
+            attention_size_b_raw = 2 * attention_size_f_raw
+            # FLOP/byte estimates for flash attention (approximate)
+            attn_score_f_flops, attn_score_b_flops, attn_score_in_bytes, attn_score_out_bytes = self._compute_gemm_flops_bytes(gemm_attention_score)
+            attn_out_f_flops, attn_out_b_flops, attn_out_in_bytes, attn_out_out_bytes = self._compute_gemm_flops_bytes(gemm_attention_output)
+            attention_flops = attn_score_f_flops + attn_out_f_flops
+            attention_flops_bwd = attn_score_b_flops + attn_out_b_flops
+            attention_bytes_f = attn_score_in_bytes + attn_score_out_bytes + attn_out_in_bytes + attn_out_out_bytes
+            attention_bytes_b = attention_bytes_f * 2
 
-        # Output Projection GEMM
-        out_proj_gemm_f, out_proj_reduction_f, out_proj_size_f = self.parallelism_gemm_forward(gemm_output_proj, "output_projection_f", gemm_type=GemmType.OUT_PROJ)
-        out_proj_gemm_b,  out_proj_reduction_b, out_proj_size_b = self.parallelism_gemm_backward(gemm_output_proj, "output_projection_b", gemm_type=GemmType.OUT_PROJ)
-        output_proj_f = out_proj_gemm_f + out_proj_reduction_f
-        output_proj_b = out_proj_gemm_b + out_proj_reduction_b
+        transformer_results['attention'] = {
+            'forward': _time(attention_f_raw),
+            'backward': _time(attention_b_raw),
+            'forward_gemm': _time(attention_gemm_f_raw),
+            'forward_reduction': _time(attention_reduction_f_raw),
+            'backward_gemm': _time(attention_gemm_b_raw),
+            'backward_reduction': _time(attention_reduction_b_raw),
+            'comm_size_forward': attention_size_f_raw,
+            'comm_size_backward': attention_size_b_raw,
+            'flops': attention_flops,
+            'flops_backward': attention_flops_bwd,
+            'input_bytes': attention_bytes_f,
+            'output_bytes': 0,
+            'input_bytes_backward': attention_bytes_b,
+            'output_bytes_backward': 0,
+        }
+
+        # Output projection
+        out_proj_gemm_f, out_proj_reduction_f, out_proj_size_f = self.parallelism_gemm_forward(
+            gemm_output_proj, "output_projection_f", gemm_type=GemmType.OUT_PROJ
+        )
+        out_proj_gemm_b, out_proj_reduction_b, out_proj_size_b = self.parallelism_gemm_backward(
+            gemm_output_proj, "output_projection_b", gemm_type=GemmType.OUT_PROJ
+        )
+        out_proj_f_raw = out_proj_gemm_f + out_proj_reduction_f
+        out_proj_b_raw = out_proj_gemm_b + out_proj_reduction_b
+        out_proj_f_flops, out_proj_b_flops, out_proj_in_bytes, out_proj_out_bytes = self._compute_gemm_flops_bytes(gemm_output_proj)
+
+        gemm_results['output_proj'] = {
+            'forward': out_proj_f_raw,
+            'backward': out_proj_b_raw,
+            'forward_gemm': out_proj_gemm_f,
+            'forward_reduction': out_proj_reduction_f,
+            'backward_gemm': out_proj_gemm_b,
+            'backward_reduction': out_proj_reduction_b,
+            'flops': out_proj_f_flops,
+            'flops_backward': out_proj_b_flops,
+            'input_bytes': out_proj_in_bytes,
+            'output_bytes': out_proj_out_bytes,
+            'input_bytes_backward': out_proj_in_bytes,
+            'output_bytes_backward': out_proj_out_bytes,
+            'comm_size_forward': out_proj_size_f,
+            'comm_size_backward': out_proj_size_b,
+        }
         transformer_results['output_proj'] = {
-            'forward': output_proj_f, 'backward': output_proj_b,
-            'forward_gemm': out_proj_gemm_f, 'forward_reduction': out_proj_reduction_f,
-            'backward_gemm': out_proj_gemm_b, 'backward_reduction': out_proj_reduction_b,
-            'comm_size_forward': out_proj_size_f, 'comm_size_backward': out_proj_size_b
-            
+            'forward': _time(out_proj_f_raw),
+            'backward': _time(out_proj_b_raw),
+            'forward_gemm': _time(out_proj_gemm_f),
+            'forward_reduction': _time(out_proj_reduction_f),
+            'backward_gemm': _time(out_proj_gemm_b),
+            'backward_reduction': _time(out_proj_reduction_b),
+            'comm_size_forward': out_proj_size_f,
+            'comm_size_backward': out_proj_size_b,
+            'flops': out_proj_f_flops,
+            'flops_backward': out_proj_b_flops,
+            'input_bytes': out_proj_in_bytes,
+            'output_bytes': out_proj_out_bytes,
+            'input_bytes_backward': out_proj_in_bytes,
+            'output_bytes_backward': out_proj_out_bytes,
         }
 
+        # FFN layers
+        ffn1_gemm_f, ffn1_reduction_f, ffn1_size_f = self.parallelism_gemm_forward(
+            gemm_ffn1, "ffn_f", gemm_type=GemmType.FFN1
+        )
+        ffn1_gemm_b, ffn1_reduction_b, ffn1_size_b = self.parallelism_gemm_backward(
+            gemm_ffn1, "ffn_b", gemm_type=GemmType.FFN1
+        )
+        ffn1_f_raw = ffn1_gemm_f + ffn1_reduction_f
+        ffn1_b_raw = ffn1_gemm_b + ffn1_reduction_b
+        ffn1_f_flops, ffn1_b_flops, ffn1_in_bytes, ffn1_out_bytes = self._compute_gemm_flops_bytes(gemm_ffn1)
 
-        # FFN1 GEMM
-        ffn1_gemm_f,  ffn1_reduction_f, ffn1_size_f = self.parallelism_gemm_forward(gemm_ffn1, "ffn_f", gemm_type=GemmType.FFN1)
-        ffn1_gemm_b,  ffn1_reduction_b, ffn1_size_b = self.parallelism_gemm_backward(gemm_ffn1, "ffn_b", gemm_type=GemmType.FFN1)
-        ffn1_f = ffn1_gemm_f + ffn1_reduction_f
-        ffn1_b = ffn1_gemm_b + ffn1_reduction_b
+        gemm_results['ffn1'] = {
+            'forward': ffn1_f_raw,
+            'backward': ffn1_b_raw,
+            'forward_gemm': ffn1_gemm_f,
+            'forward_reduction': ffn1_reduction_f,
+            'backward_gemm': ffn1_gemm_b,
+            'backward_reduction': ffn1_reduction_b,
+            'flops': ffn1_f_flops,
+            'flops_backward': ffn1_b_flops,
+            'input_bytes': ffn1_in_bytes,
+            'output_bytes': ffn1_out_bytes,
+            'input_bytes_backward': ffn1_in_bytes,
+            'output_bytes_backward': ffn1_out_bytes,
+            'comm_size_forward': ffn1_size_f,
+            'comm_size_backward': ffn1_size_b,
+        }
         transformer_results['ffn1'] = {
-            'forward': ffn1_f, 'backward': ffn1_b,
-            'forward_gemm': ffn1_gemm_f, 'forward_reduction': ffn1_reduction_f,
-            'backward_gemm': ffn1_gemm_b, 'backward_reduction': ffn1_reduction_b,
-            'comm_size_forward': ffn1_size_f, 'comm_size_backward': ffn1_size_b
+            'forward': _time(ffn1_f_raw),
+            'backward': _time(ffn1_b_raw),
+            'forward_gemm': _time(ffn1_gemm_f),
+            'forward_reduction': _time(ffn1_reduction_f),
+            'backward_gemm': _time(ffn1_gemm_b),
+            'backward_reduction': _time(ffn1_reduction_b),
+            'comm_size_forward': ffn1_size_f,
+            'comm_size_backward': ffn1_size_b,
+            'flops': ffn1_f_flops,
+            'flops_backward': ffn1_b_flops,
+            'input_bytes': ffn1_in_bytes,
+            'output_bytes': ffn1_out_bytes,
+            'input_bytes_backward': ffn1_in_bytes,
+            'output_bytes_backward': ffn1_out_bytes,
         }
 
-        # FFN2 GEMM
-        ffn2_gemm_f, ffn2_reduction_f, ffn2_size_f = self.parallelism_gemm_forward(gemm_ffn2, "ffn2_f", gemm_type=GemmType.FFN2)
-        ffn2_gemm_b,  ffn2_reduction_b, ffn2_size_b = self.parallelism_gemm_backward(gemm_ffn2, "ffn2_b", gemm_type=GemmType.FFN2)
-        ffn2_f = ffn2_gemm_f + ffn2_reduction_f
-        ffn2_b = ffn2_gemm_b + ffn2_reduction_b
+        ffn2_gemm_f, ffn2_reduction_f, ffn2_size_f = self.parallelism_gemm_forward(
+            gemm_ffn2, "ffn2_f", gemm_type=GemmType.FFN2
+        )
+        ffn2_gemm_b, ffn2_reduction_b, ffn2_size_b = self.parallelism_gemm_backward(
+            gemm_ffn2, "ffn2_b", gemm_type=GemmType.FFN2
+        )
+        ffn2_f_raw = ffn2_gemm_f + ffn2_reduction_f
+        ffn2_b_raw = ffn2_gemm_b + ffn2_reduction_b
+        ffn2_f_flops, ffn2_b_flops, ffn2_in_bytes, ffn2_out_bytes = self._compute_gemm_flops_bytes(gemm_ffn2)
+
+        gemm_results['ffn2'] = {
+            'forward': ffn2_f_raw,
+            'backward': ffn2_b_raw,
+            'forward_gemm': ffn2_gemm_f,
+            'forward_reduction': ffn2_reduction_f,
+            'backward_gemm': ffn2_gemm_b,
+            'backward_reduction': ffn2_reduction_b,
+            'flops': ffn2_f_flops,
+            'flops_backward': ffn2_b_flops,
+            'input_bytes': ffn2_in_bytes,
+            'output_bytes': ffn2_out_bytes,
+            'input_bytes_backward': ffn2_in_bytes,
+            'output_bytes_backward': ffn2_out_bytes,
+            'comm_size_forward': ffn2_size_f,
+            'comm_size_backward': ffn2_size_b,
+        }
         transformer_results['ffn2'] = {
-            'forward': ffn2_f, 'backward': ffn2_b,
-            'forward_gemm': ffn2_gemm_f, 'forward_reduction': ffn2_reduction_f,
-            'backward_gemm': ffn2_gemm_b, 'backward_reduction': ffn2_reduction_b,
-            'comm_size_forward': ffn2_size_f , 'comm_size_backward': ffn2_size_b
+            'forward': _time(ffn2_f_raw),
+            'backward': _time(ffn2_b_raw),
+            'forward_gemm': _time(ffn2_gemm_f),
+            'forward_reduction': _time(ffn2_reduction_f),
+            'backward_gemm': _time(ffn2_gemm_b),
+            'backward_reduction': _time(ffn2_reduction_b),
+            'comm_size_forward': ffn2_size_f,
+            'comm_size_backward': ffn2_size_b,
+            'flops': ffn2_f_flops,
+            'flops_backward': ffn2_b_flops,
+            'input_bytes': ffn2_in_bytes,
+            'output_bytes': ffn2_out_bytes,
+            'input_bytes_backward': ffn2_in_bytes,
+            'output_bytes_backward': ffn2_out_bytes,
         }
-        
-            
 
-        # Calculate non-GEMM operations
-        embedding_f = self.get_embedding_f()
-        embedding_b = self.get_embedding_b()
-        transformer_results['embedding'] = {'forward': embedding_f, 'backward': embedding_b}
+        # Embedding metadata
+        embedding_f_raw = self.get_embedding_f()
+        embedding_b_raw = self.get_embedding_b()
+        emb_elems = seq_len * batch_size * hidden_dim
+        emb_flops = emb_elems
+        emb_flops_bwd = emb_elems
+        emb_bytes_total = 2 * seq_len * batch_size * hidden_dim * dtype_size
+        gemm_results['embedding'] = {
+            'forward': embedding_f_raw,
+            'backward': embedding_b_raw,
+            'flops': emb_flops,
+            'flops_backward': emb_flops_bwd,
+            'input_bytes': emb_bytes_total // 2,
+            'output_bytes': emb_bytes_total // 2,
+            'input_bytes_backward': emb_bytes_total // 2,
+            'output_bytes_backward': emb_bytes_total // 2,
+            'comm_size_forward': 0,
+            'comm_size_backward': 0,
+        }
+        transformer_results['embedding'] = {
+            'forward': _time(embedding_f_raw),
+            'backward': _time(embedding_b_raw),
+            'flops': emb_flops,
+            'flops_backward': emb_flops_bwd,
+            'input_bytes': emb_bytes_total // 2,
+            'output_bytes': emb_bytes_total // 2,
+            'input_bytes_backward': emb_bytes_total // 2,
+            'output_bytes_backward': emb_bytes_total // 2,
+        }
 
+        # Residual + layernorm metadata (layernorm1/refers output proj)
+        residual1_f_raw = self.get_residual_f(gemm_output_proj)
+        residual1_b_raw = self.get_residual_b(gemm_output_proj)
+        residual_elems = batch_size * seq_len * hidden_dim
+        residual_f_flops = 2 * residual_elems
+        residual_b_flops = residual_elems
+        residual_bytes_total = dtype_size * residual_elems * 3
+        gemm_results['residual1'] = {
+            'forward': residual1_f_raw,
+            'backward': residual1_b_raw,
+            'flops': residual_f_flops,
+            'flops_backward': residual_b_flops,
+            'input_bytes': residual_bytes_total // 2,
+            'output_bytes': residual_bytes_total // 2,
+            'input_bytes_backward': residual_bytes_total // 2,
+            'output_bytes_backward': residual_bytes_total // 2,
+            'comm_size_forward': 0,
+            'comm_size_backward': 0,
+        }
 
+        layernorm1_f_raw, layernorm1_reduction_raw, ln1_comm_bytes_f = self.get_layernorm_f(
+            batch=batch_size, seq_len=seq_len, d_model=hidden_dim
+        )
+        layernorm1_b_raw, layernorm1_reduction_b_raw, ln1_comm_bytes_b = self.get_layernorm_b(
+            batch=batch_size, seq_len=seq_len, d_model=hidden_dim
+        )
+        layernorm_elems = batch_size * seq_len
+        layernorm_f_flops = layernorm_elems * hidden_dim * 11
+        layernorm_b_flops = layernorm_elems * hidden_dim * 8
+        layernorm_f_bytes_total = dtype_size * layernorm_elems * hidden_dim * 10
+        layernorm_b_bytes_total = dtype_size * layernorm_elems * hidden_dim * 12
+        gemm_results['layernorm1'] = {
+            'forward': layernorm1_f_raw,
+            'backward': layernorm1_b_raw,
+            'flops': layernorm_f_flops,
+            'flops_backward': layernorm_b_flops,
+            'input_bytes': layernorm_f_bytes_total // 2,
+            'output_bytes': layernorm_f_bytes_total // 2,
+            'input_bytes_backward': layernorm_b_bytes_total // 2,
+            'output_bytes_backward': layernorm_b_bytes_total // 2,
+            'comm_size_forward': ln1_comm_bytes_f,
+            'comm_size_backward': ln1_comm_bytes_b,
+        }
 
-        residual1_f = self.get_residual_f(tensor_shape=gemm_output_proj)
-        residual1_b = self.get_residual_b(tensor_shape=gemm_output_proj)
-        # transformer_results['residual1'] = {'forward': residual1_f, 'backward': residual1_b}
+        residual2_f_raw = self.get_residual_f(gemm_ffn2)
+        residual2_b_raw = self.get_residual_b(gemm_ffn2)
+        gemm_results['residual2'] = {
+            'forward': residual2_f_raw,
+            'backward': residual2_b_raw,
+            'flops': residual_f_flops,
+            'flops_backward': residual_b_flops,
+            'input_bytes': residual_bytes_total // 2,
+            'output_bytes': residual_bytes_total // 2,
+            'input_bytes_backward': residual_bytes_total // 2,
+            'output_bytes_backward': residual_bytes_total // 2,
+            'comm_size_forward': 0,
+            'comm_size_backward': 0,
+        }
 
-        layernorm1_f, layernorm_reduction_f, LN1_comm_bytes_f= self.get_layernorm_f(batch=batch_size, seq_len=seq_len, d_model=hidden_dim)
-        layernorm1_b, layernorm_reduction_b, LN1_comm_bytes_b= self.get_layernorm_b(batch=batch_size, seq_len=seq_len, d_model=hidden_dim)
-        transformer_results['layernorm1'] = {'forward': layernorm1_f + residual1_f +layernorm_reduction_f,'forward_compute': layernorm1_f + residual1_f, 'forward_reduction':layernorm_reduction_f, 'backward': layernorm1_b + residual1_b + layernorm_reduction_b,"backward_compute":layernorm1_b + residual1_b , 'backward_reduction': layernorm_reduction_b, 'comm_size_forward': LN1_comm_bytes_f, 'comm_size_backward': LN1_comm_bytes_b}
+        layernorm2_f_raw, layernorm2_reduction_raw, ln2_comm_bytes_f = self.get_layernorm_f(
+            batch=batch_size, seq_len=seq_len, d_model=hidden_dim
+        )
+        layernorm2_b_raw, layernorm2_reduction_b_raw, ln2_comm_bytes_b = self.get_layernorm_b(
+            batch=batch_size, seq_len=seq_len, d_model=hidden_dim
+        )
+        gemm_results['layernorm2'] = {
+            'forward': layernorm2_f_raw,
+            'backward': layernorm2_b_raw,
+            'flops': layernorm_f_flops,
+            'flops_backward': layernorm_b_flops,
+            'input_bytes': layernorm_f_bytes_total // 2,
+            'output_bytes': layernorm_f_bytes_total // 2,
+            'input_bytes_backward': layernorm_b_bytes_total // 2,
+            'output_bytes_backward': layernorm_b_bytes_total // 2,
+            'comm_size_forward': ln2_comm_bytes_f,
+            'comm_size_backward': ln2_comm_bytes_b,
+        }
 
-        residual2_f = self.get_residual_f(tensor_shape=gemm_ffn2)
-        residual2_b = self.get_residual_b(tensor_shape=gemm_ffn2)
-        # transformer_results['residual2'] = {'forward': residual2_f, 'backward': residual2_b}
-
-        layernorm2_f, layernorm_reduction_f, LN2_comm_bytes_f = self.get_layernorm_f(batch=batch_size, seq_len=seq_len, d_model=hidden_dim)
-        layernorm2_b, layernorm_reduction_b, LN2_comm_bytes_b = self.get_layernorm_b(batch=batch_size, seq_len=seq_len, d_model=hidden_dim)
-        transformer_results['layernorm2'] = {'forward': layernorm2_f + residual2_f + layernorm_reduction_f, "forward_compute": layernorm2_f + residual2_f, 'forward_reduction':layernorm_reduction_f,'backward': layernorm2_b + residual2_b + layernorm_reduction_b, "backward_compute":layernorm2_b + residual2_b, 'backward_reduction': layernorm_reduction_b, 'comm_size_forward': LN2_comm_bytes_f, 'comm_size_backward': LN2_comm_bytes_b}
-        
         if self.model_type == "llama":
-            act_f = self.get_swiglu_f(tensor_shape=gemm_ffn1)
-            act_b = self.get_swiglu_b(tensor_shape=gemm_ffn1)
+            act_f_raw = self.get_swiglu_f(tensor_shape=gemm_ffn1)
+            act_b_raw = self.get_swiglu_b(tensor_shape=gemm_ffn1)
+            act_forward_flops = self.seq_len * batch_size * hidden_dim * SWIGLU_SILU_FORWARD_FLOPS_PER_ELEMENT
+            act_backward_flops = self.seq_len * batch_size * hidden_dim * SWIGLU_SILU_BACKWARD_FLOPS_PER_ELEMENT
         else:
-            act_f = self.get_gelu_f(tensor_shape=gemm_ffn1)
-            act_b = self.get_gelu_b(tensor_shape=gemm_ffn1)
-        transformer_results['gelu'] = {'forward': act_f, 'backward': act_b}
+            act_f_raw = self.get_gelu_f(tensor_shape=gemm_ffn1)
+            act_b_raw = self.get_gelu_b(tensor_shape=gemm_ffn1)
+            act_forward_flops = self.seq_len * batch_size * hidden_dim * GELU_FORWARD_FLOPS_PER_ELEMENT
+            act_backward_flops = self.seq_len * batch_size * hidden_dim * GELU_BACKWARD_FLOPS_PER_ELEMENT
+        act_bytes_total = dtype_size * batch_size * seq_len * hidden_dim * 2
+        gemm_results['gelu'] = {
+            'forward': act_f_raw,
+            'backward': act_b_raw,
+            'flops': act_forward_flops,
+            'flops_backward': act_backward_flops,
+            'input_bytes': act_bytes_total // 2,
+            'output_bytes': act_bytes_total // 2,
+            'input_bytes_backward': act_bytes_total // 2,
+            'output_bytes_backward': act_bytes_total // 2,
+            'comm_size_forward': 0,
+            'comm_size_backward': 0,
+        }
 
-        linear_softmax_f = self.get_linear_softmax_f(gemm=gemm_linear)
-        linear_softmax_b = self.get_linear_softmax_b(gemm=gemm_linear)
-        transformer_results['linear_softmax'] = {'forward': linear_softmax_f, 'backward': linear_softmax_b}
+        linear_softmax_f_raw = self.get_linear_softmax_f(gemm=gemm_linear)
+        linear_softmax_b_raw = self.get_linear_softmax_b(gemm=gemm_linear)
+        linear_softmax_elems = batch_size * seq_len * vocab_size
+        linear_softmax_f_flops = 5 * linear_softmax_elems
+        linear_softmax_b_flops = 6 * linear_softmax_elems
+        linear_softmax_f_bytes_total = dtype_size * linear_softmax_elems * 8
+        linear_softmax_b_bytes_total = dtype_size * linear_softmax_elems * 10
+        gemm_results['linear_softmax'] = {
+            'forward': linear_softmax_f_raw,
+            'backward': linear_softmax_b_raw,
+            'flops': linear_softmax_f_flops,
+            'flops_backward': linear_softmax_b_flops,
+            'input_bytes': linear_softmax_f_bytes_total // 2,
+            'output_bytes': linear_softmax_f_bytes_total // 2,
+            'input_bytes_backward': linear_softmax_b_bytes_total // 2,
+            'output_bytes_backward': linear_softmax_b_bytes_total // 2,
+            'comm_size_forward': 0,
+            'comm_size_backward': 0,
+        }
+        transformer_results['linear_softmax'] = {
+            'forward': _time(linear_softmax_f_raw),
+            'backward': _time(linear_softmax_b_raw),
+            'flops': linear_softmax_f_flops,
+            'flops_backward': linear_softmax_b_flops,
+            'input_bytes': linear_softmax_f_bytes_total // 2,
+            'output_bytes': linear_softmax_f_bytes_total // 2,
+            'input_bytes_backward': linear_softmax_b_bytes_total // 2,
+            'output_bytes_backward': linear_softmax_b_bytes_total // 2,
+        }
 
-        # Calculate MHA and FFN times directly from results dict
-        mha_time_f = ( 
-            transformer_results['qkv_proj']['forward'] + transformer_results['attention']['forward'] + transformer_results['output_proj']['forward'] 
+        # Combine per-op metadata
+        mha_flops_f = (
+            gemm_results['qkv_proj']['flops'] + attention_flops + gemm_results['output_proj']['flops']
         )
-        
-        
-        mha_time_b = ( 
-            transformer_results['qkv_proj']['backward'] + transformer_results['attention']['backward'] + transformer_results['output_proj']['backward'] 
+        mha_flops_b = (
+            gemm_results['qkv_proj']['flops_backward'] + attention_flops_bwd + gemm_results['output_proj']['flops_backward']
         )
+        mha_bytes_f = (
+            gemm_results['qkv_proj']['input_bytes'] + gemm_results['qkv_proj']['output_bytes'] +
+            attention_bytes_f + gemm_results['output_proj']['input_bytes'] + gemm_results['output_proj']['output_bytes']
+        )
+        mha_bytes_b = (
+            gemm_results['qkv_proj']['input_bytes_backward'] + gemm_results['qkv_proj']['output_bytes_backward'] +
+            attention_bytes_b + gemm_results['output_proj']['input_bytes_backward'] + gemm_results['output_proj']['output_bytes_backward']
+        )
+
+        ffn_time_f_raw = ffn1_f_raw + ffn2_f_raw + act_f_raw
+        ffn_time_b_raw = ffn1_b_raw + ffn2_b_raw + act_b_raw
+        ffn_flops_f = gemm_results['ffn1']['flops'] + gemm_results['ffn2']['flops'] + gemm_results['gelu']['flops']
+        ffn_flops_b = gemm_results['ffn1']['flops_backward'] + gemm_results['ffn2']['flops_backward'] + gemm_results['gelu']['flops_backward']
+        ffn_bytes_f = (
+            gemm_results['ffn1']['input_bytes'] + gemm_results['ffn1']['output_bytes'] +
+            gemm_results['ffn2']['input_bytes'] + gemm_results['ffn2']['output_bytes']
+        )
+        ffn_bytes_b = (
+            gemm_results['ffn1']['input_bytes_backward'] + gemm_results['ffn1']['output_bytes_backward'] +
+            gemm_results['ffn2']['input_bytes_backward'] + gemm_results['ffn2']['output_bytes_backward']
+        )
+
         transformer_results['MHA'] = {
-            'forward': mha_time_f,
-            'backward': mha_time_b,
-            "forward_reduction": qkv_proj_reduction_f + attention_reduction_f + out_proj_reduction_f,
-            "backward_reduction": qkv_proj_reduction_b + attention_reduction_b + out_proj_reduction_b,
-            "comm_size_forward": qkv_proj_size_f + attention_size_f + out_proj_size_f,
-            "comm_size_backward": qkv_proj_size_b + attention_size_b + out_proj_size_b,
+            'forward': _time(attention_f_raw + qkv_proj_f_raw + out_proj_f_raw),
+            'backward': _time(attention_b_raw + qkv_proj_b_raw + out_proj_b_raw),
+            'forward_gemm': _time(attention_gemm_f_raw + qkv_proj_gemm_f + out_proj_gemm_f),
+            'forward_reduction': _time(attention_reduction_f_raw + qkv_proj_reduction_f + out_proj_reduction_f),
+            'backward_gemm': _time(attention_gemm_b_raw + qkv_proj_gemm_b + out_proj_gemm_b),
+            'backward_reduction': _time(attention_reduction_b_raw + qkv_proj_reduction_b + out_proj_reduction_b),
+            'comm_size_forward': attention_size_f_raw + qkv_proj_size_f + out_proj_size_f,
+            'comm_size_backward': attention_size_b_raw + qkv_proj_size_b + out_proj_size_b,
+            'flops': mha_flops_f,
+            'flops_backward': mha_flops_b,
+            'input_bytes': mha_bytes_f,
+            'output_bytes': 0,
+            'input_bytes_backward': mha_bytes_b,
+            'output_bytes_backward': 0,
         }
 
-        ffn_time_f = transformer_results['ffn1']['forward'] + transformer_results['ffn2']['forward'] + transformer_results['gelu']['forward']
-        ffn_time_b = (
-            transformer_results['ffn1']['backward'] + transformer_results['ffn2']['backward'] + transformer_results['gelu']['backward']
-        )
         transformer_results['MLP'] = {
-            'forward': ffn_time_f,
-            'backward': ffn_time_b,
-            "forward_reduction": ffn2_reduction_f + ffn1_reduction_f,
-            "backward_reduction": ffn1_reduction_b + ffn2_reduction_b,
-            "comm_size_forward": ffn2_size_f + ffn1_size_f,
-            "comm_size_backward": ffn1_size_b + ffn2_size_b,
+            'forward': _time(ffn_time_f_raw),
+            'backward': _time(ffn_time_b_raw),
+            'forward_gemm': _time(ffn1_gemm_f + ffn2_gemm_f + act_f_raw),
+            'forward_reduction': _time(ffn1_reduction_f + ffn2_reduction_f),
+            'backward_gemm': _time(ffn1_gemm_b + ffn2_gemm_b + act_b_raw),
+            'backward_reduction': _time(ffn1_reduction_b + ffn2_reduction_b),
+            'comm_size_forward': ffn1_size_f + ffn2_size_f,
+            'comm_size_backward': ffn1_size_b + ffn2_size_b,
+            'flops': ffn_flops_f,
+            'flops_backward': ffn_flops_b,
+            'input_bytes': ffn_bytes_f,
+            'output_bytes': 0,
+            'input_bytes_backward': ffn_bytes_b,
+            'output_bytes_backward': 0,
         }
-        # Calculate transformer times directly
-        
-        transformer_time_f = (
-            transformer_results['MHA']['forward'] + transformer_results['MLP']['forward']  +
+
+        layernorm1_forward_total = layernorm1_f_raw + residual1_f_raw + layernorm1_reduction_raw
+        layernorm1_backward_total = layernorm1_b_raw + residual1_b_raw + layernorm1_reduction_b_raw
+        transformer_results['layernorm1'] = {
+            'forward': _time(layernorm1_forward_total),
+            'backward': _time(layernorm1_backward_total),
+            'forward_compute': _time(layernorm1_f_raw + residual1_f_raw),
+            'forward_reduction': _time(layernorm1_reduction_raw),
+            'backward_compute': _time(layernorm1_b_raw + residual1_b_raw),
+            'backward_reduction': _time(layernorm1_reduction_b_raw),
+            'comm_size_forward': ln1_comm_bytes_f,
+            'comm_size_backward': ln1_comm_bytes_b,
+            'flops': gemm_results['layernorm1']['flops'] + gemm_results['residual1']['flops'],
+            'flops_backward': gemm_results['layernorm1']['flops_backward'] + gemm_results['residual1']['flops_backward'],
+            'input_bytes': gemm_results['layernorm1']['input_bytes'] + gemm_results['residual1']['input_bytes'],
+            'output_bytes': gemm_results['layernorm1']['output_bytes'] + gemm_results['residual1']['output_bytes'],
+            'input_bytes_backward': gemm_results['layernorm1']['input_bytes_backward'] + gemm_results['residual1']['input_bytes_backward'],
+            'output_bytes_backward': gemm_results['layernorm1']['output_bytes_backward'] + gemm_results['residual1']['output_bytes_backward'],
+        }
+
+        layernorm2_forward_total = layernorm2_f_raw + residual2_f_raw + layernorm2_reduction_raw
+        layernorm2_backward_total = layernorm2_b_raw + residual2_b_raw + layernorm2_reduction_b_raw
+        transformer_results['layernorm2'] = {
+            'forward': _time(layernorm2_forward_total),
+            'backward': _time(layernorm2_backward_total),
+            'forward_compute': _time(layernorm2_f_raw + residual2_f_raw),
+            'forward_reduction': _time(layernorm2_reduction_raw),
+            'backward_compute': _time(layernorm2_b_raw + residual2_b_raw),
+            'backward_reduction': _time(layernorm2_reduction_b_raw),
+            'comm_size_forward': ln2_comm_bytes_f,
+            'comm_size_backward': ln2_comm_bytes_b,
+            'flops': gemm_results['layernorm2']['flops'] + gemm_results['residual2']['flops'],
+            'flops_backward': gemm_results['layernorm2']['flops_backward'] + gemm_results['residual2']['flops_backward'],
+            'input_bytes': gemm_results['layernorm2']['input_bytes'] + gemm_results['residual2']['input_bytes'],
+            'output_bytes': gemm_results['layernorm2']['output_bytes'] + gemm_results['residual2']['output_bytes'],
+            'input_bytes_backward': gemm_results['layernorm2']['input_bytes_backward'] + gemm_results['residual2']['input_bytes_backward'],
+            'output_bytes_backward': gemm_results['layernorm2']['output_bytes_backward'] + gemm_results['residual2']['output_bytes_backward'],
+        }
+
+        transformer_time_f_raw = (
+            transformer_results['MHA']['forward'] + transformer_results['MLP']['forward'] +
             transformer_results['layernorm1']['forward'] + transformer_results['layernorm2']['forward']
+        ) if annotate else (
+            qkv_proj_f_raw + attention_f_raw + out_proj_f_raw + ffn_time_f_raw + layernorm1_forward_total + layernorm2_forward_total
         )
-        transformer_time_b = (
+        transformer_time_b_raw = (
             transformer_results['MHA']['backward'] + transformer_results['MLP']['backward'] +
             transformer_results['layernorm1']['backward'] + transformer_results['layernorm2']['backward']
+        ) if annotate else (
+            qkv_proj_b_raw + attention_b_raw + out_proj_b_raw + ffn_time_b_raw + layernorm1_backward_total + layernorm2_backward_total
         )
-        
+
+        transformer_f_flops = (
+            gemm_results['qkv_proj']['flops'] + attention_flops + gemm_results['output_proj']['flops'] +
+            gemm_results['ffn1']['flops'] + gemm_results['ffn2']['flops'] + gemm_results['gelu']['flops'] +
+            gemm_results['layernorm1']['flops'] + gemm_results['residual1']['flops'] +
+            gemm_results['layernorm2']['flops'] + gemm_results['residual2']['flops']
+        )
+        transformer_b_flops = (
+            gemm_results['qkv_proj']['flops_backward'] + attention_flops_bwd + gemm_results['output_proj']['flops_backward'] +
+            gemm_results['ffn1']['flops_backward'] + gemm_results['ffn2']['flops_backward'] + gemm_results['gelu']['flops_backward'] +
+            gemm_results['layernorm1']['flops_backward'] + gemm_results['residual1']['flops_backward'] +
+            gemm_results['layernorm2']['flops_backward'] + gemm_results['residual2']['flops_backward']
+        )
+        transformer_f_bytes = (
+            gemm_results['qkv_proj']['input_bytes'] + gemm_results['qkv_proj']['output_bytes'] + attention_bytes_f +
+            gemm_results['output_proj']['input_bytes'] + gemm_results['output_proj']['output_bytes'] +
+            gemm_results['ffn1']['input_bytes'] + gemm_results['ffn1']['output_bytes'] +
+            gemm_results['ffn2']['input_bytes'] + gemm_results['ffn2']['output_bytes'] +
+            gemm_results['gelu']['input_bytes'] + gemm_results['gelu']['output_bytes'] +
+            gemm_results['layernorm1']['input_bytes'] + gemm_results['layernorm1']['output_bytes'] +
+            gemm_results['residual1']['input_bytes'] + gemm_results['residual1']['output_bytes'] +
+            gemm_results['layernorm2']['input_bytes'] + gemm_results['layernorm2']['output_bytes'] +
+            gemm_results['residual2']['input_bytes'] + gemm_results['residual2']['output_bytes']
+        )
+        transformer_b_bytes = (
+            gemm_results['qkv_proj']['input_bytes_backward'] + gemm_results['qkv_proj']['output_bytes_backward'] + attention_bytes_b +
+            gemm_results['output_proj']['input_bytes_backward'] + gemm_results['output_proj']['output_bytes_backward'] +
+            gemm_results['ffn1']['input_bytes_backward'] + gemm_results['ffn1']['output_bytes_backward'] +
+            gemm_results['ffn2']['input_bytes_backward'] + gemm_results['ffn2']['output_bytes_backward'] +
+            gemm_results['gelu']['input_bytes_backward'] + gemm_results['gelu']['output_bytes_backward'] +
+            gemm_results['layernorm1']['input_bytes_backward'] + gemm_results['layernorm1']['output_bytes_backward'] +
+            gemm_results['residual1']['input_bytes_backward'] + gemm_results['residual1']['output_bytes_backward'] +
+            gemm_results['layernorm2']['input_bytes_backward'] + gemm_results['layernorm2']['output_bytes_backward'] +
+            gemm_results['residual2']['input_bytes_backward'] + gemm_results['residual2']['output_bytes_backward']
+        )
+
+        transformer_results['transformer'] = {
+            'forward': _time(transformer_time_f_raw),
+            'backward': _time(transformer_time_b_raw),
+            'flops': transformer_f_flops,
+            'flops_backward': transformer_b_flops,
+            'input_bytes': transformer_f_bytes,
+            'output_bytes': 0,
+            'input_bytes_backward': transformer_b_bytes,
+            'output_bytes_backward': 0,
+        }
 
         node_breakdown = {
-            'transformer_time_f': transformer_time_f,
-            'transformer_time_b': transformer_time_b,
-            'embedding_f': transformer_results['embedding']['forward'],
-            'embedding_b': transformer_results['embedding']['backward'],
-            'linear_softmax_f': transformer_results['linear_softmax']['forward'],
-            'linear_softmax_b': transformer_results['linear_softmax']['backward']
+            'transformer_time_f': _time(transformer_time_f_raw),
+            'transformer_time_b': _time(transformer_time_b_raw),
+            'embedding_f': _time(embedding_f_raw),
+            'embedding_b': _time(embedding_b_raw),
+            'linear_softmax_f': _time(linear_softmax_f_raw),
+            'linear_softmax_b': _time(linear_softmax_b_raw),
+            'transformer_f_flops': transformer_f_flops,
+            'transformer_b_flops': transformer_b_flops,
+            'transformer_f_bytes': transformer_f_bytes,
+            'transformer_b_bytes': transformer_b_bytes,
+            'embedding_f_flops': gemm_results['embedding']['flops'],
+            'embedding_b_flops': gemm_results['embedding']['flops_backward'],
+            'embedding_f_bytes': gemm_results['embedding']['input_bytes'] + gemm_results['embedding']['output_bytes'],
+            'embedding_b_bytes': gemm_results['embedding']['input_bytes_backward'] + gemm_results['embedding']['output_bytes_backward'],
+            'linear_softmax_f_flops': linear_softmax_f_flops,
+            'linear_softmax_b_flops': linear_softmax_b_flops,
+            'linear_softmax_f_bytes': linear_softmax_f_bytes_total,
+            'linear_softmax_b_bytes': linear_softmax_b_bytes_total,
+            'kv_cache_fetch': 0.0,
+            'kv_cache_store': 0.0,
         }
 
         results_path = os.path.join(self.output_dir, "transformer_results.txt")
@@ -1434,6 +1977,7 @@ class TimeCalculationLLM(TimeCalculation):
                 json.dump(
                     {
                         "transformer_results": transformer_results,
+                        "gemm_results": gemm_results,
                         "node_breakdown": node_breakdown,
                     },
                     results_file,
@@ -1445,8 +1989,6 @@ class TimeCalculationLLM(TimeCalculation):
                 print(f"[WARN] Unable to write transformer results to {results_path}: {exc}")
 
         return transformer_results, node_breakdown
-
-
     def _effective_transformer_batch(self) -> int:
         if self.lp > 1:
             return self.microB
@@ -1653,6 +2195,10 @@ class TimeCalculationLLM(TimeCalculation):
                         "comm_keys": [],
                     },
                 }
+                entry["forward"]["flops"] = spec.get("flops", 0)
+                entry["forward"]["bytes"] = spec.get("input_bytes", 0) + spec.get("output_bytes", 0)
+                entry["backward"]["flops"] = spec.get("flops_backward", 0)
+                entry["backward"]["bytes"] = spec.get("input_bytes_backward", spec.get("input_bytes", 0)) + spec.get("output_bytes_backward", spec.get("output_bytes", 0))
 
                 self._populate_transformer_comm_metadata(
                     entry=entry,
@@ -1689,6 +2235,10 @@ class TimeCalculationLLM(TimeCalculation):
                         "comm_keys": [],
                     },
                 }
+                entry["forward"]["flops"] = spec.get("flops", 0)
+                entry["forward"]["bytes"] = spec.get("input_bytes", 0) + spec.get("output_bytes", 0)
+                entry["backward"]["flops"] = spec.get("flops_backward", 0)
+                entry["backward"]["bytes"] = spec.get("input_bytes_backward", spec.get("input_bytes", 0)) + spec.get("output_bytes_backward", spec.get("output_bytes", 0))
 
                 self._populate_transformer_comm_metadata(
                     entry=entry,
@@ -1728,10 +2278,22 @@ class TimeCalculationLLM(TimeCalculation):
         comp_times = {
             "embedding_f": node_breakdown.get('embedding_f', 0.0),
             "embedding_b": node_breakdown.get('embedding_b', 0.0) if include_pipeline_backward else 0.0,
+            "embedding_f_flops": node_breakdown.get('embedding_f_flops', 0),
+            "embedding_f_bytes": node_breakdown.get('embedding_f_bytes', 0),
+            "embedding_b_flops": node_breakdown.get('embedding_b_flops', 0) if include_pipeline_backward else 0,
+            "embedding_b_bytes": node_breakdown.get('embedding_b_bytes', 0) if include_pipeline_backward else 0,
             "linear_softmax_f": node_breakdown.get('linear_softmax_f', 0.0),
             "linear_softmax_b": node_breakdown.get('linear_softmax_b', 0.0) if include_pipeline_backward else 0.0,
+            "linear_softmax_f_flops": node_breakdown.get('linear_softmax_f_flops', 0),
+            "linear_softmax_f_bytes": node_breakdown.get('linear_softmax_f_bytes', 0),
+            "linear_softmax_b_flops": node_breakdown.get('linear_softmax_b_flops', 0) if include_pipeline_backward else 0,
+            "linear_softmax_b_bytes": node_breakdown.get('linear_softmax_b_bytes', 0) if include_pipeline_backward else 0,
             "transformer_f": node_breakdown.get('transformer_time_f', 0.0),
             "transformer_b": node_breakdown.get('transformer_time_b', 0.0) if include_pipeline_backward else 0.0,
+            "transformer_f_flops": node_breakdown.get('transformer_f_flops', 0),
+            "transformer_f_bytes": node_breakdown.get('transformer_f_bytes', 0),
+            "transformer_b_flops": node_breakdown.get('transformer_b_flops', 0) if include_pipeline_backward else 0,
+            "transformer_b_bytes": node_breakdown.get('transformer_b_bytes', 0) if include_pipeline_backward else 0,
             "kv_cache_fetch": node_breakdown.get('kv_cache_fetch', 0.0),
             "kv_cache_store": node_breakdown.get('kv_cache_store', 0.0),
             "cross_layer_f": 0.0,
