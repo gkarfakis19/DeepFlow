@@ -3,7 +3,25 @@
 
 sw_param:
   kernel_launch_overhead: 9e-6
-  precision: 2
+  precision:
+    # tensor_format accepts numeric byte counts or dtype strings (fp16, bf16, fp32).
+    # Take care that the number of flops defined below has been carefully tuned for FP16/BF16 formats.
+    # For FP32 or other formats they need to be manually adjusted.
+    # The following are equivalent: (tensor_format: 2.0, tensor_format: fp16, tensor_format: bf16).
+    tensor_format: bf16  # baseline storage width for activations/gradients.
+    # mixed_precision: true | false
+    # -> false forces all activations/weights/gradients/optimizer states/stats to use tensor_format bytes. 
+    # -> true enables AMP-style FP32 accumulations/optimizer states depending on param_storage_mode.
+    # if true, optimizer states and stats are always FP32.
+    mixed_precision: false
+    # param_storage_mode: as_tensor_format | tensor_plus_fp32_master | fp32_params.
+    # -> as_tensor_format makes weights/gradients use tensor_format bytes. 
+    # -> tensor_plus_fp32_master makes weights/gradients use tensor_format bytes and
+    #    keeps a separate FP32 master copy for weights.
+    # -> fp32_params makes weights *and* gradients use FP32 bytes without a master copy.
+    param_storage_mode: as_tensor_format
+    # kv_cache precision may be set as bytes, dtype string, or "as_tensor_format".
+    kv_cache: as_tensor_format
   h2d_bandwidth: 13297674240  # Bytes/s; set -1 to disable H2D timing
 tech_param:
   core:
@@ -188,6 +206,5 @@ execution_backend:
       preferred_dataset_splits: 32 # Should be same as active_chunks_per_dimension
 
 inference:
-  kvcache_precision: 2  # bytes per element
   kvcache_type: hbm_only
   kvcache_fetch_overlap: false

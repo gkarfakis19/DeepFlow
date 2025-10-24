@@ -114,23 +114,29 @@ def process_gemm_shapes(self, batch_size, seq_len, d_model, num_heads, kv_heads,
 
     return processed
 
-def get_transformer_mem_layer( d, t, batch_size, hidden_dim, seq_len, ffn_dim, n_heads, precision, model_type="gpt"):#https://www.determined.ai/blog/act-mem-1.  https://arxiv.org/pdf/2205.05198. https://shjwudp.github.io/blog/2023/gpt-training-memory-estimation-nemo-training-practice/?utm_source=chatgpt.com
+def get_transformer_mem_layer( d, t, batch_size, hidden_dim, seq_len, ffn_dim, n_heads, precision, model_type="gpt"):#https://www.determined.ai/blog/act-mem-1.  https://arxiv.org/pdf/2205.05198. https://shjwudp.github.io/blog/2023/gpt-training-memory-estimation-nemo-training-practice/
     #Activations refer to output activations that need to be stored
     alpha = 16 + ffn_dim/hidden_dim #parameter need to be changed accordingly
     beta = 3
     # d  data parallelism degree
     # t  #tensor parallelism degree
-    
-    act_memory_layer = seq_len * batch_size * hidden_dim * (34 / t + 5 * n_heads * seq_len/(hidden_dim * t) ) * precision / 2 #from https://arxiv.org/pdf/2205.05198
-    act_memory_layer_inf = seq_len * batch_size * ffn_dim / t * precision  #inference max activation memory, no need to store for backpropagation
+
+    act_memory_layer = seq_len * batch_size * hidden_dim * (34 / t + 5 * n_heads * seq_len/(hidden_dim * t) ) * (precision.activations / 2) #from https://arxiv.org/pdf/2205.05198
+    act_memory_layer_inf = seq_len * batch_size * ffn_dim / t * precision.activations  #inference max activation memory, no need to store for backpropagation
     ffn_proj_factor = 3 if str(model_type).lower() == "llama" else 2
-    transformer_param_layer = (4 ) * hidden_dim * hidden_dim + ffn_dim * ffn_proj_factor * hidden_dim  # weights Wq,Wk,Wv,Wo,ffn
-    optimizer_mem = 10 * transformer_param_layer * precision/ 2 / (t * d) 
-    weight_memory_layer = 2 * transformer_param_layer * precision / t / 2  # assuming stored in a 16-bit floating point according to paper
-    gradient_mem = 4 * transformer_param_layer * precision / t / 2  # assuming stored in a 16-bit floating point according to paper
-    static_memory_layer = (6 + 10 / d) * transformer_param_layer / t * precision / 2  #optimizer states + gradients + weights
-
-
+    transformer_param_layer = 4* hidden_dim * hidden_dim + ffn_dim * ffn_proj_factor * hidden_dim  # weights Wq,Wk,Wv,Wo,ffn
+    optimizer_mem = 10 * transformer_param_layer * (precision.optimizer_states / 2) / (t * d)
+    tensor_weight_memory_layer = transformer_param_layer * precision.parameters / t
+    # master_parameters is set to 0 by default, so this works.
+    master_weight_memory_layer = transformer_param_layer * precision.master_parameters / t
+    weight_memory_layer = tensor_weight_memory_layer + master_weight_memory_layer
+    # precision has been replaced with a class that has many different precision types.
+    # furthemore, we have added this "master weight" copy for weights that are stored in FP32 optionally.
+    # for weight_memory_layer it makes sense to just add them together. But I can see it's only really used in infernece?
+    # for training, static_memory_layer needs to be broken up into different equations that use the correct precisions.
+    # TODO TODO TODO
+    gradient_mem = 2 * transformer_param_layer * precision.gradients / t  # gradient buffers scaled by precision
+    static_memory_layer = (6 + 10 / d) * transformer_param_layer / t * (precision.optimizer_states / 2) # optimizer states + gradients + weights
     layer_mem = (act_memory_layer + weight_memory_layer)
     #cross entropy not included
 
@@ -147,29 +153,29 @@ def get_linear_softmax_mem(batch_size, seq_len, hidden_dim, vocab_size, precisio
     # #1 exp
     # #1 pointwise div
     # softmax_mem = (softmax_act + softmax_wt + softmax_point)
-    mem = 4 * seq_len * batch_size * hidden_dim / t *(1+vocab_size/hidden_dim) * precision / 2 #from https://arxiv.org/pdf/2205.05198
+    mem = 4 * seq_len * batch_size * hidden_dim / t *(1+vocab_size/hidden_dim) * (precision.activations / 2) #from https://arxiv.org/pdf/2205.05198
     return mem
 
 
 def get_embedding_act_mem(batch_size, seq_len, hidden_dim, p, t, precision):
-    mem = 4 * seq_len * batch_size * hidden_dim * p / t * precision / 2  # from https://arxiv.org/pdf/2205.05198
+    mem = 4 * seq_len * batch_size * hidden_dim * p / t * (precision.activations / 2)  # from https://arxiv.org/pdf/2205.05198
 
     return mem
     
 def get_embedding_weight_mem(
     vocab_size: int,
     hidden_dim: int,
-    precision: int,
+    precision,
     tied_embeddings: bool = True,
     param_replica_factor: int = 1,  # Should be equal to dp. For ZeRO-3 (future work) set to 1.
 ) -> int:
     """
     Embedding WEIGHT memory per rank:
       - Input embeddings: (V*H*bytes)/vocab_shards * replica_factor
+      (vocab shards is WIP)
       - Output head: same as input if untied, else 0.
-    Paper assumes tying; we expose the switch.
     """
-    per_matrix = (vocab_size * hidden_dim * precision)
+    per_matrix = vocab_size * hidden_dim * (precision.parameters + precision.master_parameters) / 1.0
     input_embed = per_matrix * param_replica_factor
     output_head = 0 if tied_embeddings else per_matrix * param_replica_factor
     return input_embed + output_head

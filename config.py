@@ -6,6 +6,118 @@ from collections import namedtuple as _namedtuple
 from typing import Optional
 
 
+_PRECISION_DTYPE_BYTES = {
+    "fp8": 1.0,
+    "fp16": 2.0,
+    "half": 2.0,
+    "bf16": 2.0,
+    "fp32": 4.0,
+    "single": 4.0,
+}
+
+
+@dataclass(frozen=True)
+class PrecisionConfig:
+    tensor: float
+    mixed_precision: bool
+    param_storage_mode: str
+    kv_cache: float
+    parameters: float
+    gradients: float
+    grad_communication: float
+    optimizer_states: float
+    stats: float
+    master_parameters: float
+
+    @property
+    def activations(self) -> float:
+        return self.tensor
+
+    @property
+    def tensor_format(self) -> float:
+        return self.tensor
+
+    @property
+    def requires_master_copy(self) -> bool:
+        return self.master_parameters > 0.0
+
+def _coerce_precision_value(value, *, tensor_bytes: Optional[float] = None, allow_as_tensor: bool = False) -> float:
+    if isinstance(value, (int, float)):
+        if value <= 0:
+            raise ValueError("precision byte size must be positive")
+        return float(value)
+
+    if not isinstance(value, str):
+        raise TypeError(f"Unsupported precision specification type: {type(value)!r}")
+
+    normalized = value.strip().lower()
+    if allow_as_tensor and normalized == "as_tensor_format":
+        return float(tensor_bytes)
+
+    if normalized in _PRECISION_DTYPE_BYTES:
+        return _PRECISION_DTYPE_BYTES[normalized]
+
+    parsed = float(normalized)
+    if parsed <= 0:
+        raise ValueError("precision byte size must be positive")
+    return parsed
+
+
+def _parse_precision_block(spec: dict) -> PrecisionConfig:
+    tensor_bytes = _coerce_precision_value(spec["tensor_format"])
+    mixed = bool(spec["mixed_precision"])
+
+    raw_mode = str(spec["param_storage_mode"]).strip().lower()
+    if raw_mode not in {"as_tensor_format", "tensor_plus_fp32_master", "fp32_params"}:
+        raise ValueError(
+            "sw_param.precision.param_storage_mode must be one of 'as_tensor_format', "
+            "'tensor_plus_fp32_master', or 'fp32_params'"
+        )
+    if raw_mode == "tensor_plus_fp32_master" and not mixed:
+        raise ValueError("tensor_plus_fp32_master requires mixed_precision=true")
+
+    kv_cache_bytes = _coerce_precision_value(
+        spec["kv_cache"],
+        tensor_bytes=tensor_bytes,
+        allow_as_tensor=True,
+    )
+
+    if not mixed:
+        parameter_bytes = tensor_bytes
+        gradient_bytes = tensor_bytes
+        grad_comm_bytes = tensor_bytes
+        optimizer_bytes = tensor_bytes
+        stats_bytes = tensor_bytes
+        effective_mode = "as_tensor_format"
+        master_bytes = 0.0
+    else:
+        effective_mode = raw_mode
+        optimizer_bytes = 4.0 # FP32
+        stats_bytes = 4.0 # FP32
+        master_bytes = 4.0 if raw_mode == "tensor_plus_fp32_master" else 0.0
+        if raw_mode == "fp32_params":
+            parameter_bytes = 4.0 # FP32
+            gradient_bytes = 4.0 # FP32
+            grad_comm_bytes = 4.0 # FP32
+        else:
+            parameter_bytes = tensor_bytes
+            gradient_bytes = tensor_bytes
+            grad_comm_bytes = tensor_bytes
+
+    return PrecisionConfig(
+        tensor=tensor_bytes,
+        mixed_precision=mixed,
+        param_storage_mode=effective_mode,
+        kv_cache=kv_cache_bytes,
+        parameters=parameter_bytes,
+        gradients=gradient_bytes,
+        grad_communication=grad_comm_bytes,
+        optimizer_states=optimizer_bytes,
+        stats=stats_bytes,
+        master_parameters=master_bytes,
+    )
+
+
 @dataclass
 class CoreConfig:
     nominal_power_per_mcu: float
@@ -518,7 +630,6 @@ ExecutionBackend = _namedtuple(
 InferenceHWConfig = _namedtuple(
     "InferenceHWConfig",
     [
-        "kvcache_precision",
         "kvcache_type",
         "kvcache_fetch_overlap",
     ],
@@ -609,16 +720,21 @@ def parse_config(filename, config_type):
         # print(config_dict) 
         convert(config_dict)
     if config_type == "hardware":
-        sw_params = dict(config_dict["sw_param"])
-        sw_params.setdefault("h2d_bandwidth", 12.4 * 1024 * 1024 * 1024)
-        sw_config = SWConfig(**sw_params)
+        sw_block = dict(config_dict["sw_param"])
+        precision_spec = sw_block["precision"]
+        precision_config = _parse_precision_block(precision_spec)
+        kernel_launch_overhead = sw_block["kernel_launch_overhead"]
+        h2d_bandwidth = sw_block["h2d_bandwidth"]
+        sw_config = SWConfig(
+            kernel_launch_overhead=kernel_launch_overhead,
+            precision=precision_config,
+            h2d_bandwidth=h2d_bandwidth,
+        )
         sch_params = dict(config_dict["scheduling_param"])
         if "tp" not in sch_params:
             sch_params["tp"] = None
         if "cp" not in sch_params:
             sch_params["cp"] = None
-        if "tp_sp" in sch_params:
-            tp_sp_value = sch_params["tp_sp"]
         sch_config = SchedulingConfig(**sch_params)
         tech_config = TechConfig.from_dict(config_dict["tech_param"])
         power_config = PowerBreakdownConfig.from_dict(config_dict["power_breakdown"])
@@ -670,7 +786,6 @@ def parse_config(filename, config_type):
 
         inference_dict = config_dict.get("inference", {}) or {}
         inference_cfg = InferenceHWConfig(
-            kvcache_precision=inference_dict.get("kvcache_precision", sw_config.precision),
             kvcache_type=inference_dict.get("kvcache_type", "hbm_only"),
             kvcache_fetch_overlap=bool(inference_dict.get("kvcache_fetch_overlap", False)),
         )

@@ -190,6 +190,9 @@ class TimeCalculation:
         # Software Parameters
         self.O = hw_config.sw_config.kernel_launch_overhead
         self.precision = hw_config.sw_config.precision
+        self.precision_bytes = self.precision.activations
+        # TimeCalculation only uses activations precision for everything
+        # If we want proper backported LSTM support we need to fix this at *some* point.
         self.h2d_bandwidth = getattr(hw_config.sw_config, "h2d_bandwidth", -1)
         self.attached = True
 
@@ -359,7 +362,7 @@ class TimeCalculation:
 
         self.network_model = NetworkModel(
             hw_config,
-            self.precision,
+            self.precision_bytes,
             self.O,
             self.roofline,
             astra_policy=self._astra_policy,
@@ -823,7 +826,7 @@ class TimeCalculation:
         best_metric = float("inf")
 
         # Iterate directly over candidates from tile module; no string orders
-        for gemm in TiledGEMM.enumerate_candidates(self.core, self.memLayer, dim1, dim2, dim3, self.precision, original=False):
+        for gemm in TiledGEMM.enumerate_candidates(self.core, self.memLayer, dim1, dim2, dim3, self.precision_bytes, original=False):
             if self.debug:
                 print("===============================================================")
                 print(f"inner_code: {gemm._inner_code}")
@@ -985,7 +988,7 @@ class TimeCalculation:
             num_mem = (
                 num_repeat * (dim1 * dim2 * reload_A + dim2 * dim3 * reload_B)
                 + r[0] * dim1 * r[2] * dim3 * reload_C
-            ) * self.precision
+            ) * self.precision_bytes
         else:
             num_mem = (
                 num_repeat
@@ -994,10 +997,10 @@ class TimeCalculation:
                     + dim2 * dim3 * reload_B
                     + dim1 * dim3 * reload_C
                 )
-                * self.precision
+                * self.precision_bytes
             )
 
-        # num_mem = num_repeat * (dim1 * dim2 * reload_A + dim2 * dim3 * reload_B + dim1 * dim3 * reload_C) * self.precision
+        # num_mem = num_repeat * (dim1 * dim2 * reload_A + dim2 * dim3 * reload_B + dim1 * dim3 * reload_C) * self.precision_bytes
 
         if self.debug:
             print(name)
@@ -1050,7 +1053,7 @@ class TimeCalculation:
         if algByte:
             num_accesses[self.num_levels - 1] = (
                 dim1 * dim2 + dim2 * dim3 + dim1 * dim3
-            ) * self.precision
+            ) * self.precision_bytes
         else:
             num_repeat = 1
             for level in range(self.num_levels - 1, 0, -1):
@@ -1111,7 +1114,7 @@ class TimeCalculation:
                 raise NotImplementedError()
 
             # TODO: make sure to model underutilized systolic array
-            num_accesses[0] = GEMM_flop * ((2 * reuse + 1) / (2 * reuse)) * 1/(2 * self.FMA_dims[0]) * self.precision
+            num_accesses[0] = GEMM_flop * ((2 * reuse + 1) / (2 * reuse)) * 1/(2 * self.FMA_dims[0]) * self.precision_bytes
 
             # num_accesses[0] = (
             #     GEMM_flop
@@ -1120,10 +1123,10 @@ class TimeCalculation:
             #         + self.FMA_dims[0] ** 2
             #     )
             #     / (2 * reuse * self.FMA_dims[0] * (self.FMA_dims[1] - 1))
-            #     * self.precision
+            #     * self.precision_bytes
             # )
-            # num_accesses[0]    = GEMM_flop * ((2 * reuse + 1) / (2 * reuse)) * 1/self.FMA_width * self.precision
-            # num_accesses[0]    = GEMM_flop * ((2 * reuse + self.FMA_width) / (2 * reuse)) * 1/self.FMA_width * self.precision
+            # num_accesses[0]    = GEMM_flop * ((2 * reuse + 1) / (2 * reuse)) * 1/self.FMA_width * self.precision_bytes
+            # num_accesses[0]    = GEMM_flop * ((2 * reuse + self.FMA_width) / (2 * reuse)) * 1/self.FMA_width * self.precision_bytes
 
             # TODO: do we still need these in new hierarchical version?
             #  if X3 == 0:
@@ -1163,7 +1166,7 @@ class TimeCalculation:
         # 4 refers to the number of pointwise ops (mul + add +tanh + mul + tanh) on
         # the critical path
         point_mem = (
-            self.precision
+            self.precision_bytes
             * self.miniB
             * (self.G * self.D / self.kp_hidden_dim1)
             * (3 * 3 + 2 * 2)
@@ -1174,7 +1177,7 @@ class TimeCalculation:
         # 1(tanh) on critical path
 
         data_size = (
-            4 * self.miniB * (self.G * self.D / self.kp_hidden_dim1) * self.precision
+            4 * self.miniB * (self.G * self.D / self.kp_hidden_dim1) * self.precision_bytes
         )
         # 4 refers to the number of pointwise ops (mul + add + mul + tanh) on the
         # critical path whose inputs are located across different GPUs
@@ -1206,11 +1209,11 @@ class TimeCalculation:
     #     # 4 refers to the number of pointwise ops (mul + add +tanh + mul) on
     #     # the critical path
     #     point_mem = (
-    #         self.precision
+    #         self.precision_bytes
     #         * self.miniB
     #         * (self.G * self.D / self.kp_hidden_dim1)
     #         * (3 * 3 + 2 * 2)
-    #         + (2 * self.precision * self.D * self.G * self.D / self.kp_hidden_dim1) * 3
+    #         + (2 * self.precision_bytes * self.D * self.G * self.D / self.kp_hidden_dim1) * 3
     #     )  # local accumulation of wts
     #     # 3(3 memory access per operation with two input and one output)
     #     # 3(mul +  add + mul) on critical path
@@ -1225,11 +1228,11 @@ class TimeCalculation:
         # 4 refers to the number of pointwise ops (mul + add +tanh + mul) on
         # the critical path
         point_mem = (
-            self.precision
+            self.precision_bytes
             * self.miniB
             * (self.G * self.D / self.kp_hidden_dim1)
             * (3 * 3 + 2 * 2)
-            + (2 * self.precision * self.D * self.G * self.D / self.kp_hidden_dim1) * 3
+            + (2 * self.precision_bytes * self.D * self.G * self.D / self.kp_hidden_dim1) * 3
         )  # local accumulation of wts
         # 3(3 memory access per operation with two input and one output)
         # 3(mul +  add + mul) on critical path
@@ -1237,7 +1240,7 @@ class TimeCalculation:
         # 1(tanh) on critical path
 
         data_size = (
-            4 * self.miniB * (self.G * self.D / self.kp_hidden_dim1) * self.precision
+            4 * self.miniB * (self.G * self.D / self.kp_hidden_dim1) * self.precision_bytes
         )
         mem_transfer = self.roofline(
             0,
@@ -1301,7 +1304,7 @@ class TimeCalculation:
         # 4 refers to the number of pointwise ops (mul + add +tanh + mul) on
         # the critical path
         point_mem = int(
-            self.precision
+            self.precision_bytes
             * (self.miniB / self.kp_hidden_dim1)
             * (self.G * self.D / self.kp_hidden_dim2)
             * (3 * 3 + 2 * 2)
@@ -1314,7 +1317,7 @@ class TimeCalculation:
             (self.miniB / self.kp_hidden_dim1)
             * (self.G * self.D / self.kp_hidden_dim2)
             * 4
-            * self.precision
+            * self.precision_bytes
         )
         # 4 refers to the number of pointwise ops (mul + add + tanh + mul) whose inputs
         # across different GPU
@@ -1350,12 +1353,12 @@ class TimeCalculation:
         # for (B,4D)x(4D,2D).This is outerproduct due to the data distribution.
         point_mem = int(
             (
-                self.precision
+                self.precision_bytes
                 * (self.miniB / self.kp_hidden_dim1)
                 * (self.G * self.D / self.kp_hidden_dim2)
                 * (3 * 3 + 2 * 2)
             )
-            + (2 * self.precision * self.D * self.G * self.D / self.kp_hidden_dim2) * 3
+            + (2 * self.precision_bytes * self.D * self.G * self.D / self.kp_hidden_dim2) * 3
         )  # local accumulation of wts
         # 3(3 memory access per operation with two input and one output)
         # 3(mul +  add + mul) on critical path
@@ -1363,7 +1366,7 @@ class TimeCalculation:
         # 1(tanh) on critical path
 
         data_size = int(
-            self.miniB * (self.G * self.D / self.kp_hidden_dim2) * 4 * self.precision
+            self.miniB * (self.G * self.D / self.kp_hidden_dim2) * 4 * self.precision_bytes
         )
         # 3 refers to the number of pointwise ops (mul + add +tanh + mul) on
         # 3 refers to the number of hops to gather i,f, o and c in each GPU
@@ -1412,7 +1415,7 @@ class TimeCalculation:
         # 1: add bias
         # 5: add nonlinearities, there is one more than the number of gates (self.G)
         # 1: pointwise muliply and add
-        point_mem = self.precision * m * n * (3 * 3 + 2 * 2)
+        point_mem = self.precision_bytes * m * n * (3 * 3 + 2 * 2)
         # 3: 3 memory accesses for operands with two inputs and one output
         # 2: 1 for bias add + 1 for pointwise mul
         # 2: 2 memory accesses for operands with one input and one output
@@ -1447,8 +1450,8 @@ class TimeCalculation:
         point_flop = (self.miniB * self.D * 5) + (
             2 * self.D * self.G * self.D
         )  # local accumulation of wts
-        point_mem = (self.precision * self.miniB * self.D * (3 * 3 + 2 * 2)) + (
-            2 * self.precision * self.D * self.G * self.D
+        point_mem = (self.precision_bytes * self.miniB * self.D * (3 * 3 + 2 * 2)) + (
+            2 * self.precision_bytes * self.D * self.G * self.D
         ) * 3  # local accumulation of wts
         point_time = (
             self.roofline(point_flop, point_mem, name="pointwise_Cb") + 5 * self.O
@@ -1480,7 +1483,7 @@ class TimeCalculation:
         norm_comp = Dim0 * Dim1 * 2
         # 1: power 2
         # 1: summ
-        norm_mem = (Dim0 * Dim1 * 1) * self.precision
+        norm_mem = (Dim0 * Dim1 * 1) * self.precision_bytes
         # 1: one read per element and power it by 2 in local registers  anfd
         # summing to local acc
 
@@ -1488,7 +1491,7 @@ class TimeCalculation:
         # 1: pointwise mul
         # 1: pointwise div
 
-        clip_mem = (Dim0 * Dim1 * 2) * self.precision
+        clip_mem = (Dim0 * Dim1 * 2) * self.precision_bytes
         # 1: one read for pointwise mul
         # 1: one write for pointwise div
 
@@ -1522,9 +1525,9 @@ class TimeCalculation:
         #   one final addition of gradients to the weights
         #   one multiply by learning rate
         applyGrad_mem = (
-            (1 * Dim0 * Dim1 * self.precision)
-            + (2 * Dim0 * Dim1 * self.precision)
-            + (1 * Dim0 * Dim1 * self.precision)
+            (1 * Dim0 * Dim1 * self.precision_bytes)
+            + (2 * Dim0 * Dim1 * self.precision_bytes)
+            + (1 * Dim0 * Dim1 * self.precision_bytes)
         )
         # 1: read for pointiwse div
         # 2: 1 reads and one write for pointwise add
@@ -1560,7 +1563,7 @@ class TimeCalculation:
         gemm_time = self.getGEMMTime(m, k // dim1, n, name)[0]
         gemm_time *= batch
         # Sum-Reduce within each row for use in the next time step
-        total_bytes = math.ceil(self.precision * m * n)
+        total_bytes = math.ceil(self.precision_bytes * m * n)
         total_bytes *= batch
         
         reduction_time = self.network_model.collective(
@@ -1580,7 +1583,7 @@ class TimeCalculation:
         # calculate grad wrt. act (A'. W^T)
         # gather whole(A') before MM
         # A' is distibuted as columns across different nodes
-        total_bytes = math.ceil(self.precision * m * n)
+        total_bytes = math.ceil(self.precision_bytes * m * n)
         total_bytes *= batch
         size_bytes = math.ceil(total_bytes / dim1)
         reduction_time = self.network_model.collective(
@@ -1602,7 +1605,7 @@ class TimeCalculation:
     def getDistGEMM_f_kp2(self, m, k, n, dim1, dim2, name, batch = 1):
         gemm_time = self.getGEMMTime(m // dim1, k, n // dim2, name)[0]
         gemm_time *= batch
-        total_bytes = math.ceil(self.precision * (m // dim1) * n)
+        total_bytes = math.ceil(self.precision_bytes * (m // dim1) * n)
         total_bytes *= batch
         size_bytes = math.ceil(total_bytes / dim2)
         reduction_time = self.network_model.collective(
@@ -1631,7 +1634,7 @@ class TimeCalculation:
         ######################################################################################
         # calculate grad wrt. weights (A^T. grad(A'))
         # gather row(A^T)
-        total_bytes = math.ceil(self.precision * k * m)
+        total_bytes = math.ceil(self.precision_bytes * k * m)
         total_bytes *= batch
         size_bytes = math.ceil(total_bytes / dim1)
         reduction_time_wt1 = self.network_model.collective(
@@ -1645,7 +1648,7 @@ class TimeCalculation:
         )
         # To calculate grad wrt weights (A^T, grad(A')),
         # gather column grad(A')
-        total_bytes = math.ceil(self.precision * m * (n / dim2))
+        total_bytes = math.ceil(self.precision_bytes * m * (n / dim2))
         total_bytes *= batch
         size_bytes = math.ceil(total_bytes / dim1)
         reduction_time_wt2 = self.network_model.collective(
@@ -1661,7 +1664,7 @@ class TimeCalculation:
         ########################################################################################
         # calculate grad wrt. act (grad(A'). w^T)
         # gather row grad(A')
-        total_bytes = math.ceil(self.precision * (m / dim1) * n)
+        total_bytes = math.ceil(self.precision_bytes * (m / dim1) * n)
         total_bytes *= batch
         size_bytes = math.ceil(total_bytes / dim2)
         reduction_time_act1 = self.network_model.collective(
@@ -1675,7 +1678,7 @@ class TimeCalculation:
         )
         # calculate grad wrt. act (grad(A'). w^T)
         # gather col(w^T)
-        total_bytes = math.ceil(self.precision * k * n)
+        total_bytes = math.ceil(self.precision_bytes * k * n)
         total_bytes *= batch
         size_bytes = math.ceil(total_bytes / dim2)
         reduction_time_act2 = self.network_model.collective(
@@ -1717,7 +1720,7 @@ class TimeCalculation:
 
         if self.kp_hidden_type == 1:  # CR
             reduction_time_wt_kp = 0
-            total_bytes = math.ceil(self.precision * (k / dim1) * n)
+            total_bytes = math.ceil(self.precision_bytes * (k / dim1) * n)
             reduction_time_wt_dp = self.network_model.collective(
                 kind="all_reduce",
                 size_bytes=total_bytes,
@@ -1730,7 +1733,7 @@ class TimeCalculation:
             apply_grad_time = self.apply_grad(Dim0=k / dim1, Dim1=n, name=name)
 
         elif self.kp_hidden_type == 2:  # RC
-            total_bytes = math.ceil(self.precision * (k / dim1) * (n / dim2))
+            total_bytes = math.ceil(self.precision_bytes * (k / dim1) * (n / dim2))
             reduction_time_wt_dp = self.network_model.collective(
                 kind="all_reduce",
                 size_bytes=total_bytes,
@@ -1742,7 +1745,7 @@ class TimeCalculation:
             )
 
             # gather col(w)
-            total_bytes = math.ceil(self.precision * k * (n / dim2))
+            total_bytes = math.ceil(self.precision_bytes * k * (n / dim2))
             size_bytes = math.ceil(total_bytes / dim1)
             reduction_time_wt_kp = self.network_model.collective(
                 kind="all_gather",
@@ -1756,7 +1759,7 @@ class TimeCalculation:
             apply_grad_time = self.apply_grad(Dim0=k, Dim1=n / dim2, name=name)
         else:
             reduction_time_wt_kp = 0
-            total_bytes = math.ceil(self.precision * k * n)
+            total_bytes = math.ceil(self.precision_bytes * k * n)
             reduction_time_wt_dp = self.network_model.collective(
                 kind="all_reduce",
                 size_bytes=total_bytes,
@@ -1856,7 +1859,7 @@ class TimeCalculation:
         # Up to here is 3 operations
         point_flop = self.miniB * (3 * self.V - 1)
 
-        point_mem = self.precision * self.miniB * (7 * self.V)
+        point_mem = self.precision_bytes * self.miniB * (7 * self.V)
         # 2: one read and one write for sigmoid
         # 1: one read for reduction
         # 1: one write for extension
@@ -1893,7 +1896,7 @@ class TimeCalculation:
         # 1: one for addition, copies turn into add
         # 1: one for sigmoid
 
-        point_mem = self.precision * self.miniB * self.V * 11
+        point_mem = self.precision_bytes * self.miniB * self.V * 11
         # 3: grad(A) in pointwise division
         # 3: grad(B) in pointwise division
         # 3: addition in copy backprop
@@ -1937,13 +1940,13 @@ class TimeCalculation:
         # After GEMM reduction, each matrix has the full (B,V)
         # but each needs to only operate on 1/dim1 rows to get the reduction
         point_flop = (self.miniB / self.kp_softmax_dim1) * self.V * 3
-        point_mem = self.precision * (self.miniB / self.kp_softmax_dim1) * self.V * 7
+        point_mem = self.precision_bytes * (self.miniB / self.kp_softmax_dim1) * self.V * 7
         # 2: sigmoid
         # 1: one read for reduction, the accumulate is a register
         # 1: one for write/extend the reduction result into all cells
         # 3: division needs one for read and one for write.
 
-        total_bytes = math.ceil(self.precision * self.miniB * 1)
+        total_bytes = math.ceil(self.precision_bytes * self.miniB * 1)
         size_bytes = math.ceil(total_bytes / self.kp_softmax_dim1)
         point_comm = self.network_model.collective(
             kind="all_gather",
@@ -1984,7 +1987,7 @@ class TimeCalculation:
         # 1: one for sigmoid
 
         point_mem = (
-            self.precision * (self.miniB) * ((11 * self.V) / self.kp_softmax_dim1)
+            self.precision_bytes * (self.miniB) * ((11 * self.V) / self.kp_softmax_dim1)
         )
         # 3: grad(A) in pointwise division
         # 3: grad(B) in pointwise division
@@ -2043,7 +2046,7 @@ class TimeCalculation:
             (self.miniB / self.kp_softmax_dim1) * (self.V / self.kp_softmax_dim2) * 3
         )
         point_mem = (
-            self.precision
+            self.precision_bytes
             * (self.miniB / self.kp_softmax_dim1)
             * (self.V / self.kp_softmax_dim2)
             * 7
@@ -2054,7 +2057,7 @@ class TimeCalculation:
         # 3: division needs one for read and one for write.
 
         data_size = (
-            self.precision
+            self.precision_bytes
             * (self.miniB / self.kp_softmax_dim1)
             * (self.kp_softmax_dim2)
         )
@@ -2101,7 +2104,7 @@ class TimeCalculation:
         # 1: one for sigmoid
 
         point_mem = (
-            self.precision
+            self.precision_bytes
             * (self.miniB / self.kp_softmax_dim1)
             * ((11 * self.V) / self.kp_softmax_dim2)
         )
@@ -2137,7 +2140,7 @@ class TimeCalculation:
         return reduction_time + GEMM_time + point_time
 
     def getEmbedding_f(self):
-        embedding_mem = 2 * (self.miniB * self.D * self.precision)
+        embedding_mem = 2 * (self.miniB * self.D * self.precision_bytes)
         embedding_time = self.roofline(0, embedding_mem, name="embedding_f") + self.O
         if self.H2Dbw and self.H2Dbw > 0:
             embedding_transfer_time = embedding_mem / self.H2Dbw
@@ -2148,10 +2151,10 @@ class TimeCalculation:
         return embedding_time + embedding_transfer_time
 
     def getEmbedding_b(self):
-        # p2p_data_transfer = (self.precision * self.miniB * self.D)
+        # p2p_data_transfer = (self.precision_bytes * self.miniB * self.D)
         # data_transfer_time  = 0 if (self.dp == 1) else (float("inf") if (self.IBD == 0) else (((p2p_data_transfer) / self.IBD + self.LLD) * 2 * (self.dp -1 )))
 
-        embedding_mem = 2 * self.miniB * self.D * self.precision
+        embedding_mem = 2 * self.miniB * self.D * self.precision_bytes
         embedding_mem_time = self.roofline(0, embedding_mem, name="embedding_b") + self.O
 
         if self.debug:
@@ -2161,7 +2164,7 @@ class TimeCalculation:
 
     def getEmbedding_f_kp1(self):
         # Each GPU has only a portion of the activations since each GPU had only a row of the weights
-        total_bytes = math.ceil(self.precision * self.miniB * self.D)
+        total_bytes = math.ceil(self.precision_bytes * self.miniB * self.D)
         size_bytes = math.ceil(total_bytes / self.kp_embedding_dim1)
         reduction_time_act = self.network_model.collective(
             kind="all_gather",
@@ -2172,7 +2175,7 @@ class TimeCalculation:
             local_bytes=3 * total_bytes,
             debug_label="getEmbedding_f_kp1",
         )
-        embedding_mem = 2 * (self.miniB * self.D * self.precision)
+        embedding_mem = 2 * (self.miniB * self.D * self.precision_bytes)
         # embedding_time = (embedding_mem)/ (self.mem_bw) + self.mem_latency + self.O
         embedding_time = self.roofline(0, embedding_mem, name="embedding_f") + self.O
         if self.debug:
@@ -2182,7 +2185,7 @@ class TimeCalculation:
     def getEmbedding_b_kp1(self):
         # Activations from previous row arrive in column fasion, they need to be gathered
         # before applying them to the local portion of the embeddings
-        total_bytes = math.ceil(self.precision * self.miniB * self.D)
+        total_bytes = math.ceil(self.precision_bytes * self.miniB * self.D)
         size_bytes = math.ceil(total_bytes / self.kp_embedding_dim1)
         reduction_time_act = self.network_model.collective(
             kind="all_gather",
@@ -2194,7 +2197,7 @@ class TimeCalculation:
             debug_label="getEmbedding_b_kp1",
         )
         # Each GPU would read through the entire actication and write as many at most as many of B rows
-        embedding_mem = 2 * self.miniB * self.D * self.precision
+        embedding_mem = 2 * self.miniB * self.D * self.precision_bytes
         embedding_mem_time = (
             self.roofline(0, embedding_mem, name="embedding_b") + self.O
         )
@@ -2207,7 +2210,7 @@ class TimeCalculation:
         embedding_mem = 2 * (
             (self.miniB / self.kp_embedding_dim1)
             * (self.D / self.kp_embedding_dim2)
-            * self.precision
+            * self.precision_bytes
         )
         embedding_time = self.roofline(0, embedding_mem, name="embedding_f") + self.O
         if self.debug:
@@ -2217,7 +2220,7 @@ class TimeCalculation:
     def getEmbedding_b_kp2(self):
         # Every GPU will update a little tile of the embedding
         # need to be gathered after the update across the rows of each column
-        total_bytes = math.ceil(self.precision * self.miniB * (self.D / self.kp_embedding_dim2))
+        total_bytes = math.ceil(self.precision_bytes * self.miniB * (self.D / self.kp_embedding_dim2))
         size_bytes = math.ceil(total_bytes / self.kp_embedding_dim1)
         reduction_time_act = self.network_model.collective(
             kind="all_gather",
@@ -2233,7 +2236,7 @@ class TimeCalculation:
             2
             * (self.miniB / self.kp_embedding_dim1)
             * (self.D / self.kp_embedding_dim2)
-            * self.precision
+            * self.precision_bytes
         )
         embedding_mem_time = (
             self.roofline(0, embedding_mem, name="embedding_b") + self.O
@@ -2273,7 +2276,7 @@ class TimeCalculation:
         if self.kp_hidden_type == -1:
             Cf = self.getCf(m=B, k=2 * D, n=G * D)
             Cb = self.getCb()
-            w_size = self.precision * B * D
+            w_size = self.precision_bytes * B * D
             Tf = self.network_model.collective(
                 kind="pipeline",
                 size_bytes=w_size,
@@ -2286,7 +2289,7 @@ class TimeCalculation:
         elif self.kp_hidden_type == 1:  # CR
             Cf = self.getCf_kp1()
             Cb = self.getCb_kp1()
-            w_size = self.precision * B * (D / self.kp_hidden_dim1)
+            w_size = self.precision_bytes * B * (D / self.kp_hidden_dim1)
             Tf = self.network_model.collective(
                 kind="pipeline",
                 size_bytes=w_size,
@@ -2299,7 +2302,7 @@ class TimeCalculation:
         elif self.kp_hidden_type == 2:  # RC
             Cf = self.getCf_kp2()
             Cb = self.getCb_kp2()
-            w_size = self.precision * (B / self.kp_hidden_dim1) * (D / self.kp_hidden_dim2)
+            w_size = self.precision_bytes * (B / self.kp_hidden_dim1) * (D / self.kp_hidden_dim2)
             Tf = self.network_model.collective(
                 kind="pipeline",
                 size_bytes=w_size,

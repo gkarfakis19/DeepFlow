@@ -87,7 +87,7 @@ def getTotMemReq(exp_hw_config, exp_model_config, **kwargs):
     projection          = exp_model_config.model_config.projection 
     S                   = int(kwargs.get('seq_len', exp_model_config.model_config.seq_len))
     G                   = exp_model_config.model_config.num_gates
-    precision           = exp_hw_config.sw_config.precision
+    precision           = exp_hw_config.sw_config.precision.activations
    
     #MiniBatch
     dp                  = int(kwargs.get('dp', exp_hw_config.sch_config.dp))
@@ -137,7 +137,7 @@ def getMemUsagePerCore(exp_hw_config, exp_model_config, **kwargs):
     projection          = exp_model_config.model_config.projection 
     S                   = int(kwargs.get('seq_len', exp_model_config.model_config.seq_len))
     G                   = exp_model_config.model_config.num_gates
-    precision           = exp_hw_config.sw_config.precision
+    precision           = exp_hw_config.sw_config.precision.activations
 
     #Parallelism Params
     dp                  = int(kwargs.get('dp', exp_hw_config.sch_config.dp))

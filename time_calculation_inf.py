@@ -35,7 +35,7 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
             batch_size=batch_size,
             kv_heads=self.kv_heads,
             head_dim=head_dim,
-            precision_bytes=self.kv_cache_precision,
+            precision_bytes=self.precision.kv_cache,
         )
         kv_cache_fetch_time = self.roofline(
             0,
@@ -545,7 +545,7 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
             batch_size=batch_size,
             kv_heads=self.kv_heads,
             head_dim=head_dim,
-            precision_bytes=self.kv_cache_precision,
+            precision_bytes=self.precision.kv_cache,
         )
         prefill_store_time = self.roofline(
             0,
@@ -683,7 +683,7 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
             batch_size=self._effective_transformer_batch(),
             kv_heads=self.kv_heads,
             head_dim=head_dim,
-            precision_bytes=self.kv_cache_precision,
+            precision_bytes=self.precision.kv_cache,
         )
         prefill_len = self.seq_len - self.model.decode_len
         decode_len = self.model.decode_len

@@ -15,7 +15,8 @@ class System:
 class Base:
     def __init__(self, exp_config):
         self.exp_config = exp_config
-        self.precision = exp_config.sw_config.precision
+        self._precision_cfg = exp_config.sw_config.precision
+        self.precision = self._precision_cfg.activations
         self.proc_chip_area_budget = exp_config.area_breakdown.proc_chip_area_budget
         self.TDP = exp_config.power_breakdown.TDP
         self.throughput = -1
