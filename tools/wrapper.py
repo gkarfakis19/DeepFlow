@@ -9,6 +9,7 @@ Configuration is driven via module-level globals—no CLI parsing.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -31,8 +32,10 @@ MLSYNTH_ROOT = REPO_ROOT / 'MLSynth'
 RUN_SELECTION = 'all'
 
 GLOBAL_CONFIG: Dict[str, object] = {
+    # 'hardware_config': REPO_ROOT / 'configs/hardware-config/a100_80GB_AA_scale.yaml',
     'hardware_config': REPO_ROOT / 'configs/hardware-config/a100_80GB_NEMO.yaml',
     # 'model_config': REPO_ROOT / 'configs/model-config/LLM.yaml',
+    # 'model_config': REPO_ROOT / 'configs/model-config/Llama1-13B_2K.yaml',
     'model_config': REPO_ROOT / 'configs/model-config/Llama2-7B.yaml',
     # 'model_config': REPO_ROOT / 'configs/model-config/Llama3.1-405B.yaml',
     'dry_run': False,
@@ -42,8 +45,8 @@ GLOBAL_CONFIG: Dict[str, object] = {
     # - zero_softmax: convert attention softmax nodes into 1-op/1-byte stubs across all ET bundles.
     # - zero_embedding: do the same for embedding/in_emb/out_emb nodes (helps when STG models embedding as a dense GEMM).
     # - zero_layernorm_residual: neutralize layernorm/residual pointwise ops for apples-to-apples tests.
-    # - zero_ffn: neutralize FFN GEMMs (forward/backward) to isolate remaining differences.
-    'zero_softmax': True,
+    # - zero_ffn: neutralize FFN GEMMs (forward/backward)
+    'zero_softmax': False,
     'zero_embedding': False,
     'zero_attention': False,
     'zero_layernorm_residual': False,
@@ -174,6 +177,31 @@ def snapshot_summary_files(dest_dir: Path) -> List[Path]:
     return summaries
 
 
+def _config_flag(value: object, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "0", "false", "no"}:
+            return False
+        if normalized in {"1", "true", "yes"}:
+            return True
+    return bool(value)
+
+
+def _config_positive_int(value: object, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        try:
+            parsed = int(float(value))
+        except (TypeError, ValueError):
+            return default
+    return parsed if parsed > 0 else default
+
+
 def run_deepflow_annotated(config: Dict[str, object]) -> Dict[str, object]:
     hardware_cfg = Path(config['hardware_config'])
     model_cfg = Path(config['model_config'])
@@ -192,6 +220,7 @@ def run_deepflow_annotated(config: Dict[str, object]) -> Dict[str, object]:
 
     env = os.environ.copy()
     env['DEEPFLOW_PERSIST_ASTRASIM_ARTIFACTS'] = '1'
+    env['DEEPFLOW_ZERO_INTERNAL_SOFTMAX'] = '1'
     if generate_visuals:
         env['DEEPFLOW_PERSIST_ARTIFACT_VIZ'] = '1'
     if dry_run or isol_astra:
@@ -625,6 +654,48 @@ def _zero_named_nodes(dest_root: Path, substrings: List[str]) -> None:
             chakra_encode(out_fh, meta)
             for node in nodes:
                 write_et_node(out_fh, node)
+        _zero_text_dump(et_path.with_suffix(".et.txt"), substrings)
+
+
+def _zero_text_dump(et_txt_path: Path, substrings: List[str]) -> None:
+    if not et_txt_path.exists():
+        return
+    try:
+        text = et_txt_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+
+    lines = text.splitlines()
+    updated = False
+    pattern_comp = re.compile(r"\btype=COMP_NODE\b")
+
+    def _replace_metric(line: str, key: str, value: int) -> tuple[str, bool]:
+        pattern = re.compile(rf"({key}=)([0-9]+(?:\.[0-9]+)?)")
+        def repl(match: re.Match) -> str:
+            return f"{match.group(1)}{value}"
+        new_line, count = pattern.subn(repl, line, count=1)
+        return new_line, bool(count)
+
+    for idx, line in enumerate(lines):
+        if not pattern_comp.search(line):
+            continue
+        if not any(sub in line for sub in substrings):
+            continue
+        new_line, changed = _replace_metric(line, "dur_us", _FAKE_DURATION_US)
+        line_changed = changed
+        new_line, changed = _replace_metric(new_line, "num_ops", _FAKE_NUM_OPS)
+        line_changed = line_changed or changed
+        new_line, changed = _replace_metric(new_line, "tensor_size", _FAKE_TENSOR_SIZE)
+        line_changed = line_changed or changed
+        if line_changed:
+            lines[idx] = new_line
+            updated = True
+
+    if updated:
+        try:
+            et_txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError:
+            pass
 
 
 def run_stg(config: Dict[str, object]) -> Dict[str, object]:
@@ -646,9 +717,11 @@ def run_stg(config: Dict[str, object]) -> Dict[str, object]:
     sched = hw_data.get('scheduling_param', {}) or {}
     dp = int(sched['dp'])
     lp = int(sched['lp'])
-    kp1 = int(sched['kp1'])
-    kp2 = int(sched['kp2'])
-    tp = max(1, kp1 * kp2)
+    tp = _config_positive_int(sched.get('tp'), 0)
+    if tp == 0:
+        raise ValueError("STG requires 'tp' in scheduling_param; legacy kp1/kp2 fields are no longer supported.")
+    cp = _config_positive_int(sched.get('cp'), 1)
+    tp_sp_flag = _config_flag(sched.get('tp_sp'), False)
     mb = int(sched['mb'])
 
     model_param = model_data.get('model_param', {}) or {}
@@ -661,6 +734,13 @@ def run_stg(config: Dict[str, object]) -> Dict[str, object]:
     num_heads = int(attention_cfg['num_heads'])
     kv_heads = int(attention_cfg.get('kv_heads', num_heads))
     ffn_dim = _compute_ffn_dim(model_param, hidden_dim)
+    model_type = str(model_param.get('model_type', 'gpt') or 'gpt').strip().lower()
+    if model_type not in {'gpt', 'llama'}:
+        raise ValueError(f"STG: model_type must be either 'gpt' or 'llama' (got {model_type!r})")
+    if model_type == 'llama':
+        model_type = 'dense'
+    elif model_type == 'gpt':
+        model_type = 'gpt'
 
     if dp > num_layers:
         raise ValueError(f"STG: dp ({dp}) cannot exceed num_layers ({num_layers})")
@@ -680,7 +760,7 @@ def run_stg(config: Dict[str, object]) -> Dict[str, object]:
     if staging_dir.exists():
         shutil.rmtree(staging_dir)
     staging_dir.mkdir(parents=True, exist_ok=True)
-    micro_batch_size = batch_size // (mb)    
+    micro_batch_size = batch_size // mb
 
     cmd = [
         str(python_exe),
@@ -690,7 +770,7 @@ def run_stg(config: Dict[str, object]) -> Dict[str, object]:
         '--dp', str(dp),
         '--tp', str(tp),
         '--pp', str(effective_pp),
-        '--sp', '1',
+        '--sp', str(cp),
         '--ep', '1',
         '--batch', str(batch_size),
         '--micro_batch', str(micro_batch_size),
@@ -701,8 +781,10 @@ def run_stg(config: Dict[str, object]) -> Dict[str, object]:
         '--kvhead', str(kv_heads),
         '--num_stacks', str(num_layers),
         '--dvocal', str(vocab_size),
-        '--model_type', 'dense',
+        '--model_type', model_type,
         '--chakra_schema_version', 'v0.0.4',
+        # "--mixed_precision", "true",
+        '--tpsp', 'true' if tp_sp_flag else 'false',
     ]
     cmd_string = ' '.join(str(part) for part in cmd)
     print(f"[Wrapper] STG command: {cmd_string}")
@@ -813,9 +895,15 @@ def _build_mlsynth_config(
 
     dp = int(sched['dp'])
     lp = int(sched['lp'])
-    kp1 = int(sched.get('kp1', 1))
-    kp2 = int(sched.get('kp2', 1))
-    tp = max(1, kp1 * kp2)
+    tp = _config_positive_int(sched.get('tp'), 0)
+    if tp == 0:
+        raise ValueError("MLSynth requires 'tp' in scheduling_param; legacy kp1/kp2 fields are no longer supported.")
+    cp = _config_positive_int(sched.get('cp'), 1)
+    if cp != 1:
+        raise ValueError(f"MLSynth does not support context parallelism (cp={cp}). Set cp to 1.")
+    if _config_flag(sched.get('tp_sp'), False):
+        print("[WARNING] MLSynth does not support tensor-sequence parallelism (tp_sp). Set tp_sp to false.")
+        # raise ValueError("MLSynth does not support tensor-sequence parallelism (tp_sp). Set tp_sp to false.")
     mb = int(sched['mb'])
     if mb <= 0:
         raise ValueError('MLSynth: micro-batches (mb) must be positive')
@@ -852,6 +940,53 @@ def _build_mlsynth_config(
             f"MLSynth requires num_layers ({num_layers}) to be divisible by pipeline stages ({effective_pp})."
         )
 
+    tp = _config_positive_int(sched.get('tp'), 0)
+    if tp == 0:
+        raise ValueError("MLSynth requires 'tp' in scheduling_param; legacy kp1/kp2 fields are no longer supported.")
+    cp = _config_positive_int(sched.get('cp'), 1)
+    if cp != 1:
+        raise ValueError(f"MLSynth does not support context parallelism (cp={cp}). Set cp to 1.")
+    if _config_flag(sched.get('tp_sp'), False):
+        print("[WARNING] MLSynth does not support tensor-sequence parallelism (tp_sp). Set tp_sp to false.")
+        # raise ValueError("MLSynth does not support tensor-sequence parallelism (tp_sp). Set tp_sp to false.")
+    mb = int(sched['mb'])
+    if mb <= 0:
+        raise ValueError('MLSynth: micro-batches (mb) must be positive')
+
+    model_param = model_data.get('model_param', {}) or {}
+    global_batch_size = int(model_param['batch_size'])
+    seq_len = int(model_param['seq_len'])
+    hidden_dim = int(model_param['hidden_dim'])
+    num_layers = int(model_param['num_layers'])
+    vocab_size = int(model_param['vocab_size'])
+    attention_cfg = model_param.get('attention') or {}
+    num_heads = int(attention_cfg.get('num_heads', 0) or 0)
+    kv_heads = int(attention_cfg.get('kv_heads', num_heads) or num_heads)
+
+    if dp > global_batch_size:
+        raise ValueError(f"MLSynth: dp ({dp}) cannot exceed batch_size ({global_batch_size})")
+
+    if global_batch_size % dp != 0:
+        raise ValueError(
+            f"MLSynth: batch_size ({global_batch_size}) must be divisible by dp ({dp})"
+        )
+
+    batch_size = global_batch_size // dp
+    if batch_size < mb:
+        raise ValueError(
+            f"MLSynth: per-rank batch ({batch_size}) must be >= microbatches ({mb})"
+        )
+
+    effective_pp = min(lp, num_layers)
+    if effective_pp != lp:
+        print(f"[Wrapper] MLSynth pipeline degree {lp} exceeds num_layers {num_layers}; clamping to {effective_pp}")
+    if num_layers % max(1, effective_pp) != 0:
+        raise ValueError(
+            f"MLSynth requires num_layers ({num_layers}) to be divisible by pipeline stages ({effective_pp})."
+        )
+
+    scaled_batch = max(1, batch_size // tp)
+
     cfg = {
         'model': {
             'name': str(model_param.get('model_name', 'transformer')),
@@ -859,7 +994,7 @@ def _build_mlsynth_config(
             'sequence_len': seq_len,
             'vocab_size': vocab_size,
             'hidden_size': hidden_dim,
-            'batch_size': batch_size,
+            'batch_size': scaled_batch,
             'num_microbatches': mb,
             'bytes_per_val': precision,
             'scale': float(scale),
@@ -898,7 +1033,8 @@ def run_mlsynth(config: Dict[str, object]) -> Dict[str, object]:
 
     mlsynth_cfg = config.get('mlsynth', {}) if isinstance(config.get('mlsynth'), dict) else {}
     scale = float(mlsynth_cfg.get('scale', 1.0))
-    retain_outputs = bool(mlsynth_cfg.get('retain_generator_outputs', False))
+    # retain_outputs = bool(mlsynth_cfg.get('retain_generator_outputs', False))
+    retain_outputs = True
 
     cfg_payload, derived = _build_mlsynth_config(hw_data, model_data, sched, scale)
 
@@ -1076,6 +1212,8 @@ def run_deepflow_ablation(config: Dict[str, object]) -> Dict[str, object]:
     env = os.environ.copy()
     env['DEEPFLOW_PERSIST_ASTRASIM_ARTIFACTS'] = '1'
     env['DEEPFLOW_ASTRA_SKIP_EXEC'] = '1'  # Always skip DeepFlow's AstraSim execution
+    env['DEEPFLOW_ANNOTATE_COMPUTE'] = '0'
+    env['DEEPFLOW_ZERO_INTERNAL_SOFTMAX'] = '1'
     if generate_visuals:
         env['DEEPFLOW_PERSIST_ARTIFACT_VIZ'] = '1'
 

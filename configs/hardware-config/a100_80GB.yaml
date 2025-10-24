@@ -119,7 +119,7 @@ perimeter_breakdown:
   intra_node: 0.33
   inter_node: 0.33
 system_hierarchy:
-  num_devices_per_node: 16
+  num_devices_per_node: 4
   num_nodes: 1
   inter_derate: 1
   intra_derate: 1
@@ -151,9 +151,9 @@ scheduling_param:
   dp: 2 # acts as replica count during inference
   lp: 2 # pipeline stages 
   mb: 2 # number of micro-batches
-  tp: 2 # tensor parallelism
-  tp_sp: true # tensor-sequence parallelism
-  cp : 2 # context parallelism
+  tp: 1 # tensor parallelism
+  tp_sp: false # tensor-sequence parallelism
+  cp : 1 # context parallelism
   ### LSTM/GEMM LEGACY PARAMS ###
   t: "CR"
   kp1: 1
@@ -173,7 +173,7 @@ scheduling_param:
 
 
 execution_backend:
-  model: analytical # analytical | astra
+  model: astra # analytical | astra
   astra:
     backend: astra
     mode: full_astrasim_flattened  # hybrid | full_astrasim_hierarchical | full_astrasim_flattened

@@ -3,7 +3,7 @@
 import math
 import os
 from typing import Any, Dict, List, Optional, Tuple
-from time_calculation_LLM import LLMExecutionDispatcher, TimeCalculationLLM, GemmType
+from time_calculation_LLM import LLMExecutionDispatcher, TimeCalculationLLM, GemmType, GELU_FORWARD_FLOPS_PER_ELEMENT, SWIGLU_SILU_FORWARD_FLOPS_PER_ELEMENT
 from simulate_inf import DecodeSample, InferenceConfig, InferenceEngine
 import LLM_util
 
@@ -27,7 +27,7 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
         dtype_size = self.dtype_size
 
         def _time(val: float) -> float:
-            return val if annotate else 0.0
+            return val
 
         head_dim = self.hidden_dim // self.num_heads
 
@@ -213,6 +213,10 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
         softmax_elems = batch_size * self.num_heads * total_seq_len * total_seq_len
         softmax_f_flops = 6 * softmax_elems
         softmax_f_bytes_total = dtype_size * softmax_elems * 11
+        if self.zero_internal_softmax:
+            attention_scale_softmax_f_raw = 0.0
+            softmax_f_flops = 0
+            softmax_f_bytes_total = 0
 
         residual_elems = batch_size * output_seq_len * self.hidden_dim
         residual_bytes_total = dtype_size * residual_elems * 3

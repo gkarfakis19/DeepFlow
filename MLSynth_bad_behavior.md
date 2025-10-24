@@ -60,3 +60,13 @@ STG’s generator does rewrite tensor dimensions by the data-parallel factor whe
 - STG: tensor shapes include `1/dp`—all per-rank workloads shrink as expected when data parallelism increases.
 
 Until MLSynth’s generator is updated, wrapper-level workarounds (e.g., renaming comm groups) cannot change this behavior.
+## MLSynth TP FLOPs Workaround
+
+MLSynth's Transformer templates ignore the configured tensor-parallel degree when computing GEMM FLOPs: `_attention_compute` and `_ffwd_compute` always use the full `batch_size * seq_len * hidden_size` operands regardless of `tp_size`. When the wrapper runs AstraSim in roofline mode, those inflated FLOP counts produce runtimes roughly `tp` times longer than DeepFlow's analytic timings.
+
+Until MLSynth fixes the generator, our wrapper scales the per-rank batch size to compensate. With scheduling params `dp`, `tp`, `lp=1`, `mb=1`:
+
+- We compute `scaled_batch = max(1, (global_batch_size / dp) / tp)` and write that into `wrapper_tmp/wrapper_input.yaml`.
+- This divides the GEMM FLOPs by the tensor-parallel degree so `num_ops` in the ET matches the work each rank actually executes, allowing roofline replay to line up with DeepFlow/DeepFlow ablation.
+
+This is only a temporary hack: it implicitly shrinks the problem size for MLSynth (and its reported communication volumes). Remove this once MLSynth's `TransformerLayer` accounts for `tp_size` in its FLOP formulas.

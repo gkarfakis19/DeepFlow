@@ -4,7 +4,7 @@ import json
 from enum import Enum
 from typing import Any, Dict, Tuple, Optional, List
 import simulate_LLM
-from LLM_excution import ExecutionMode, LLMExecutionDispatcher
+from LLM_excution import ExecutionMode, LLMExecutionDispatcher, PipelineGraphFlattener
 from simulate_LLM import Graph
 import LLM_util
 from time_calculation import TimeCalculation
@@ -202,6 +202,7 @@ class TimeCalculationLLM(TimeCalculation):
         self.memory_capacity_violation_gb = 0.0
         annotate_env = os.environ.get("DEEPFLOW_ANNOTATE_COMPUTE")
         self.annotate_compute = True if annotate_env is None else _env_flag("DEEPFLOW_ANNOTATE_COMPUTE")
+        self.zero_internal_softmax = _env_flag("DEEPFLOW_ZERO_INTERNAL_SOFTMAX")
         self.dtype_size = int(self.precision) if self.precision else 2
         if self.dtype_size <= 0:
             self.dtype_size = 2
@@ -887,6 +888,35 @@ class TimeCalculationLLM(TimeCalculation):
         input_bytes = batch * (M * K + K * N) * dtype_size
         output_bytes = batch * M * N * dtype_size
         return forward_flops, backward_flops, input_bytes, output_bytes
+
+    def _per_rank_gemm_metadata(
+        self,
+        gemm_shape: Tuple[int, ...],
+        gemm_type: GemmType,
+    ) -> Tuple[int, int, int, int]:
+        """Return FLOPs/bytes for the tensor-parallel shard executed by this rank."""
+
+        batch, m, k, n = self._expand_gemm_descriptor(gemm_shape)
+        shard_batch = batch
+        shard_m = m
+        shard_k = k
+        shard_n = n
+        tp = max(1, int(self.tp))
+        if gemm_type in (GemmType.ATTENTION_SCORE, GemmType.ATTENTION_OUTPUT):
+            shard_batch = int(math.ceil(batch / tp))
+        elif gemm_type in (GemmType.QKV, GemmType.FFN1):
+            shard_n = int(math.ceil(n / tp))
+        elif gemm_type in (GemmType.OUT_PROJ, GemmType.FFN2):
+            shard_k = int(math.ceil(k / tp))
+        elif gemm_type == GemmType.LINEAR_SOFTMAX:
+            shard_k = int(math.ceil(k / max(1, tp * int(self.cp))))
+
+        dtype_size = self.dtype_size
+        forward_flops = 2 * shard_batch * shard_m * shard_k * shard_n
+        backward_flops = 2 * shard_batch * (2 * shard_m * shard_n * shard_k)
+        input_bytes = shard_batch * (shard_m * shard_k + shard_k * shard_n) * dtype_size
+        output_bytes = shard_batch * shard_m * shard_n * dtype_size
+        return forward_flops, backward_flops, input_bytes, output_bytes
         
     def get_residual_f(self, tensor_shape):
         # Residual operates on full tensor, not just GEMM output dimension
@@ -1229,7 +1259,7 @@ class TimeCalculationLLM(TimeCalculation):
         dtype_size = self.dtype_size
 
         def _time(val: float) -> float:
-            return val if annotate else 0.0
+            return val
 
         gemm_shapes = LLM_util.process_gemm_shapes(
             self, batch_size, seq_len, hidden_dim, num_heads, kv_heads, ffn_dim, vocab_size
@@ -1270,7 +1300,9 @@ class TimeCalculationLLM(TimeCalculation):
         )
         qkv_proj_f_raw = qkv_proj_gemm_f + qkv_proj_reduction_f
         qkv_proj_b_raw = qkv_proj_gemm_b + qkv_proj_reduction_b
-        qkv_f_flops, qkv_b_flops, qkv_in_bytes, qkv_out_bytes = self._compute_gemm_flops_bytes(gemm_qkv_proj)
+        qkv_f_flops, qkv_b_flops, qkv_in_bytes, qkv_out_bytes = self._per_rank_gemm_metadata(
+            gemm_qkv_proj, GemmType.QKV
+        )
 
         gemm_results['qkv_proj'] = {
             'forward': qkv_proj_f_raw,
@@ -1323,7 +1355,9 @@ class TimeCalculationLLM(TimeCalculation):
             )
             attention_score_f_raw = attn_score_gemm_f + attn_score_reduction_f
             attention_score_b_raw = attn_score_gemm_b + attn_score_reduction_b
-            attn_score_f_flops, attn_score_b_flops, attn_score_in_bytes, attn_score_out_bytes = self._compute_gemm_flops_bytes(gemm_attention_score)
+            attn_score_f_flops, attn_score_b_flops, attn_score_in_bytes, attn_score_out_bytes = self._per_rank_gemm_metadata(
+                gemm_attention_score, GemmType.ATTENTION_SCORE
+            )
 
             gemm_results['attention_score'] = {
                 'forward': attention_score_f_raw,
@@ -1366,7 +1400,9 @@ class TimeCalculationLLM(TimeCalculation):
             )
             attention_output_f_raw = attn_out_gemm_f + attn_out_reduction_f
             attention_output_b_raw = attn_out_gemm_b + attn_out_reduction_b
-            attn_out_f_flops, attn_out_b_flops, attn_out_in_bytes, attn_out_out_bytes = self._compute_gemm_flops_bytes(gemm_attention_output)
+            attn_out_f_flops, attn_out_b_flops, attn_out_in_bytes, attn_out_out_bytes = self._per_rank_gemm_metadata(
+                gemm_attention_output, GemmType.ATTENTION_OUTPUT
+            )
 
             gemm_results['attention_output'] = {
                 'forward': attention_output_f_raw,
@@ -1408,6 +1444,13 @@ class TimeCalculationLLM(TimeCalculation):
             softmax_b_flops = 7 * softmax_elems
             softmax_f_bytes_total = dtype_size * softmax_elems * 11
             softmax_b_bytes_total = dtype_size * softmax_elems * 13
+            if self.zero_internal_softmax:
+                attention_scale_softmax_f_raw = 0.0
+                attention_scale_softmax_b_raw = 0.0
+                softmax_f_flops = 0
+                softmax_b_flops = 0
+                softmax_f_bytes_total = 0
+                softmax_b_bytes_total = 0
             gemm_results['attention_scale_softmax'] = {
                 'forward': attention_scale_softmax_f_raw,
                 'backward': attention_scale_softmax_b_raw,
@@ -1504,7 +1547,9 @@ class TimeCalculationLLM(TimeCalculation):
         )
         out_proj_f_raw = out_proj_gemm_f + out_proj_reduction_f
         out_proj_b_raw = out_proj_gemm_b + out_proj_reduction_b
-        out_proj_f_flops, out_proj_b_flops, out_proj_in_bytes, out_proj_out_bytes = self._compute_gemm_flops_bytes(gemm_output_proj)
+        out_proj_f_flops, out_proj_b_flops, out_proj_in_bytes, out_proj_out_bytes = self._per_rank_gemm_metadata(
+            gemm_output_proj, GemmType.OUT_PROJ
+        )
 
         gemm_results['output_proj'] = {
             'forward': out_proj_f_raw,
@@ -1548,7 +1593,9 @@ class TimeCalculationLLM(TimeCalculation):
         )
         ffn1_f_raw = ffn1_gemm_f + ffn1_reduction_f
         ffn1_b_raw = ffn1_gemm_b + ffn1_reduction_b
-        ffn1_f_flops, ffn1_b_flops, ffn1_in_bytes, ffn1_out_bytes = self._compute_gemm_flops_bytes(gemm_ffn1)
+        ffn1_f_flops, ffn1_b_flops, ffn1_in_bytes, ffn1_out_bytes = self._per_rank_gemm_metadata(
+            gemm_ffn1, GemmType.FFN1
+        )
 
         gemm_results['ffn1'] = {
             'forward': ffn1_f_raw,
@@ -1591,7 +1638,9 @@ class TimeCalculationLLM(TimeCalculation):
         )
         ffn2_f_raw = ffn2_gemm_f + ffn2_reduction_f
         ffn2_b_raw = ffn2_gemm_b + ffn2_reduction_b
-        ffn2_f_flops, ffn2_b_flops, ffn2_in_bytes, ffn2_out_bytes = self._compute_gemm_flops_bytes(gemm_ffn2)
+        ffn2_f_flops, ffn2_b_flops, ffn2_in_bytes, ffn2_out_bytes = self._per_rank_gemm_metadata(
+            gemm_ffn2, GemmType.FFN2
+        )
 
         gemm_results['ffn2'] = {
             'forward': ffn2_f_raw,

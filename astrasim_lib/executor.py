@@ -875,10 +875,14 @@ def convert_deepflow_graph_to_chakra_et(
                     duration_sec = getattr(task, "duration", 0.0) or 0.0
                     duration_micros = int(round(duration_sec * 1e6)) if duration_sec else 0
                     node_id = trace.next_id
+                    flops = getattr(task, "flops", 0) or 0
+                    tensor_bytes = getattr(task, "tensor_bytes", 0) or 0
                     comp_node = new_comp_node(
                         node_id,
                         f"{task.name}_{task.op_id}",
-                        max(duration_micros, 0)
+                        max(duration_micros, 0),
+                        flops=int(flops),
+                        tensor_bytes=int(tensor_bytes),
                     )
                     comp_node.ctrl_deps.extend(unique_deps)
                     trace.append_node(comp_node)

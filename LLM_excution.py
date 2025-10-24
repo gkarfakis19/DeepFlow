@@ -2,11 +2,14 @@ import math
 import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, Tuple, Optional, List, Set
+from typing import Any, Dict, Tuple, Optional, List, Set, TYPE_CHECKING
 
 import simulate_LLM
 from astrasim_lib.executor import run_astra_simulation_only_onepath
 from simulate_LLM import Graph
+
+if TYPE_CHECKING:  # Avoid circular import at runtime
+    from time_calculation_LLM import TimeCalculationLLM
 
 
 def _env_flag(name: str) -> bool:
@@ -412,7 +415,7 @@ class PipelineGraphFlattener:
 class LLMExecutionDispatcher:
     def __init__(
         self,
-        time_calc: TimeCalculationLLM,
+        time_calc: "TimeCalculationLLM",
         pipeline_graph: Graph,
         pipeline_root: Any,
         interconnect_params: Dict[str, Tuple[float, float]],

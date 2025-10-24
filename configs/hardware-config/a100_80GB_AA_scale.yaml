@@ -21,6 +21,7 @@ tech_param:
     util: 1.0
   DRAM:
     size: 80 GB
+    # bandwidth: 999999 GB
     bandwidth: 1986 GB
     num_stacks: 5
     operating_frequency: 3.024e9
@@ -77,26 +78,28 @@ tech_param:
   network:
     intra_node:
       latency: 5e-6
-      nominal_frequency: 3e9
+      # nominal_frequency: 3e9
+      nominal_frequency: 399999e9
       nominal_voltage: 1
       nominal_energy_per_link: 1e-12
       nominal_area_per_link: 100e-6
       num_links_per_mm: 400
       threshold_voltage: 0.25
       margin_voltage: 0.45
-      # util: 1
       util: 1
+      # util: 1999999
     inter_node:
       latency: 5e-6
-      nominal_frequency: 20e9
+      # nominal_frequency: 20e9
+      nominal_frequency: 200000e9
       nominal_voltage: 1.2
       nominal_energy_per_link: 13e-12
       nominal_area_per_link: 0.045
       num_links_per_mm: 20
       threshold_voltage: 0.35
       margin_voltage: 0.5
-      # util: 0.96
-      util: 1
+      util: 0.96
+      # util: 19999999
 area_breakdown:
   device_area_budget: 1330
   proc_chip_area_budget: 826
@@ -123,7 +126,7 @@ perimeter_breakdown:
   intra_node: 0.33
   inter_node: 0.33
 system_hierarchy:
-  num_devices_per_node: 8
+  num_devices_per_node: 64
   num_nodes: 1
   inter_derate: 1
   intra_derate: 1
@@ -152,12 +155,12 @@ memory_hierarchy:
 scheduling_param:
   auto: false
   ### LLM PARAMS ###
-  dp: 8 # acts as replica count during inference
-  lp: 1 # pipeline stages 
-  mb: 1 # number of micro-batches
-  tp: 1 # tensor parallelism
-  tp_sp: false # tensor-sequence parallelism
-  cp : 1 # context parallelism
+  dp: 32    # 32*tp(2)*lp(1) = 64 GPUs
+  lp: 1     # pipeline stages
+  mb: 1     # micro-batches
+  tp: 2     # tensor parallelism
+  tp_sp: false
+  cp: 1     # context parallelism
   #### LSTM/GEMM LEGACY PARAMS ###
   t: "CR"
   kp1: 1

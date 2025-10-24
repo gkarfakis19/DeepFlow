@@ -3,8 +3,8 @@ model_param:
   run_type: "training"
   tied_embeddings: true
   model_type: "llama"  # gpt assumes dense-style architecture with GELU; llama assumes llama-style architecture with SwiGLU
-  batch_size: 1024
-  seq_len: 2048        # 32768 prefill + 1024 decode
+  batch_size: 128
+  seq_len: 4096        # 32768 prefill + 1024 decode
   decode_len: 0
   # prefill len = seq_len - decode_len
   hidden_dim: 4096
