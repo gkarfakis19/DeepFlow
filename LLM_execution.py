@@ -939,6 +939,7 @@ class LLMExecutionDispatcher:
         transformer_forward_root: Optional[Any] = None,
         transformer_backward_root: Optional[Any] = None,
         no_data_parallel: bool = False,
+        derate_factors: Optional[Dict[int, float]] = None,
     ) -> None:
         self.time_calc = time_calc
         self.pipeline_graph = pipeline_graph
@@ -961,6 +962,7 @@ class LLMExecutionDispatcher:
         self._fault_space: Optional[FaultSpace] = None
         self._fault_projections: Dict[str, FaultProjectionResult] = {}
         self._initialize_fault_mappings()
+        self.derate_factors: Optional[Dict[int, float]] = derate_factors
 
     def _build_rank_layout_descriptor(self) -> Dict[str, Any]:
         hw_config = getattr(self.time_calc, "hw_config", None)
@@ -1447,6 +1449,8 @@ class LLMExecutionDispatcher:
             raise RuntimeError("Pipeline graph root is not available for flattening")
         if not self.transformer_graph:
             raise RuntimeError("Transformer graph metadata is required for flattening")
+        if self.derate_factors and max(1, getattr(self.time_calc, "dp", 1)) != 1:
+            raise RuntimeError("derate_config supports only dp=1 in flattened mode.")
 
         flattener = PipelineGraphFlattener(
             pipeline_graph=self.pipeline_graph,
@@ -1514,6 +1518,7 @@ class LLMExecutionDispatcher:
             flattened_root,
             self.time_calc,
             artifact_dir,
+            derate_map=self.derate_factors,
             **run_kwargs,
         )
 

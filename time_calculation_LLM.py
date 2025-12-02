@@ -13,6 +13,7 @@ from time_calculation import TimeCalculation
 from itertools import zip_longest  # for element-wise aggregation of memory access lists
 from timing_model import CommSpec, DirectionTiming, OperationTiming, OperationGroup
 import yaml
+from derate import load_derate_config, DerateConfigError
 def _env_flag(name: str) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -197,7 +198,7 @@ class GemmType(Enum):
 
 
 class TimeCalculationLLM(TimeCalculation):
-    def __init__(self, hw_config, model_config, mode, output_dir: Optional[str] = None):
+    def __init__(self, hw_config, model_config, mode, output_dir: Optional[str] = None, derate_config_path: Optional[str] = None):
 # Mode parameter
         execution_mode = self._derive_execution_mode(hw_config)
         astra_policy = self._map_execution_mode_to_policy(execution_mode)
@@ -251,6 +252,10 @@ class TimeCalculationLLM(TimeCalculation):
         self.pipeline_astrasim_per_rank: Optional[List[float]] = None
         self.pipeline_graph_no_dp: Optional[Graph] = None
         self.pipeline_root_no_dp: Optional[Any] = None
+        self.derate_config_path: Optional[str] = derate_config_path
+        self.derate_factors: Optional[Dict[int, float]] = None
+        if derate_config_path:
+            self._initialize_derate(derate_config_path)
 
     def _sequence_parallel_degree(self) -> int:
         """Return tensor-parallel degree used for sequence-parallel collectives.
@@ -347,6 +352,44 @@ class TimeCalculationLLM(TimeCalculation):
         """Return the total size in bytes of the KV cache."""
         total_elements = 2 * self.seq_len * self.microB * self.hidden_dim / self.num_heads * self.kv_heads
         return total_elements * self.precision.kv_cache
+
+    def _initialize_derate(self, config_path: str) -> None:
+        if self.execution_mode != ExecutionMode.FULL_ASTRASIM_FLATTENED:
+            raise ValueError("derate_config requires full_astrasim_flattened mode.")
+        if self.dp != 1:
+            raise ValueError("derate_config supports only dp=1.")
+        self._validate_derate_network(self.hw_config)
+        try:
+            self.derate_factors = load_derate_config(config_path)
+        except DerateConfigError as exc:
+            raise ValueError(f"Invalid derate_config '{config_path}': {exc}") from exc
+
+    def _validate_derate_network(self, hw_config) -> None:
+        network_layout = getattr(hw_config, "network_layout", None)
+        dimensions = getattr(network_layout, "dimensions", None) if network_layout else None
+        if not dimensions:
+            raise ValueError("derate_config requires a network layout with dimensions.")
+        dims = list(dimensions)
+        if len(dims) != 1:
+            raise ValueError("derate_config supports a single network dimension containing only tp/cp.")
+        dim = dims[0]
+        parallels = [str(p).strip().lower() for p in getattr(dim, "parallelisms", ()) or ()]
+        if set(parallels) != {"tp", "cp"}:
+            raise ValueError("derate_config requires the first network dimension to contain exactly {'tp','cp'}.")
+        topo = str(getattr(dim, "topology_type", "")).strip().lower()
+        if topo not in {"mesh2d", "torus2d", "kingmesh2d"}:
+            raise ValueError("derate_config requires the first dimension to be a 2D topology (mesh2d/torus2d/kingmesh2d).")
+        try:
+            declared_size = int(getattr(dim, "size", 0))
+        except Exception:
+            declared_size = 0
+        if declared_size != max(1, self.tp) * max(1, self.cp):
+            raise ValueError(
+                "derate_config requires the first dimension size to equal tp * cp "
+                f"(got size={declared_size}, tp={self.tp}, cp={self.cp})."
+            )
+        if self.tp < 1 or self.cp < 1:
+            raise ValueError("derate_config requires tp>=1 and cp>=1.")
 
     @staticmethod
     def _derive_execution_mode(hw_config) -> ExecutionMode:
@@ -2596,6 +2639,7 @@ class TimeCalculationLLM(TimeCalculation):
                 transformer_forward_root=self.transformer_forward_root,
                 transformer_backward_root=self.transformer_backward_root,
                 no_data_parallel=True,
+                derate_factors=self.derate_factors,
             )
             try:
                 result_no_dp = dispatcher_no_dp.run(mode)
@@ -2612,6 +2656,7 @@ class TimeCalculationLLM(TimeCalculation):
             transformer_forward_root=self.transformer_forward_root,
             transformer_backward_root=self.transformer_backward_root,
             no_data_parallel=False,
+            derate_factors=self.derate_factors,
         )
         try:
             result = dispatcher.run(mode)

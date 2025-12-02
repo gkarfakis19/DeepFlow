@@ -12,6 +12,7 @@ import yaml
 import shutil
 import util
 from util import log_message, flush_log_queue, extend_log
+from typing import Optional
 
 import graphviz_async
 from tile import TiledGEMM, formatBytes
@@ -52,6 +53,11 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description="Run performance analysis for LSTM, GEMM, or LLM models.")
     parser.add_argument("--hardware_config", required=True, help="Path to the hardware configuration file.")
     parser.add_argument("--model_config", required=True, help="Path to the model configuration file.")
+    parser.add_argument(
+        "--derate_config",
+        required=False,
+        help="Optional path to per-device derate factors (flattened AstraSim LLM only).",
+    )
     return parser.parse_args()
 
 def get_mode_from_config(model_config_path):
@@ -215,7 +221,8 @@ def run_LLM(
     exp_hw_config_path,
     exp_model_config_path,
     exp_dir,
-    mode):
+    mode,
+    derate_config_path: Optional[str] = None):
 
     exp_hw_path = os.path.expandvars(os.path.expanduser(exp_hw_config_path))
     exp_model_path = os.path.expandvars(os.path.expanduser(exp_model_config_path))
@@ -226,15 +233,21 @@ def run_LLM(
 
     llm_run_type = getattr(exp_model_config.model_config, "run_type", "training")
     if str(llm_run_type).lower() == "inference":
-        _run_llm_inference(exp_hw_config, exp_model_config, exp_dir, mode)
+        _run_llm_inference(exp_hw_config, exp_model_config, exp_dir, mode, derate_config_path=derate_config_path)
         return
 
-    _run_llm_training(exp_hw_config, exp_model_config, exp_dir, mode)
+    _run_llm_training(exp_hw_config, exp_model_config, exp_dir, mode, derate_config_path=derate_config_path)
 
 
-def _run_llm_training(exp_hw_config, exp_model_config, exp_dir, mode):
+def _run_llm_training(exp_hw_config, exp_model_config, exp_dir, mode, derate_config_path: Optional[str] = None):
     output_file = os.path.join(exp_dir, "LLM_training_results.txt")
-    tc_llm = TimeCalculationLLM(exp_hw_config, exp_model_config, mode, output_dir=exp_dir)
+    tc_llm = TimeCalculationLLM(
+        exp_hw_config,
+        exp_model_config,
+        mode,
+        output_dir=exp_dir,
+        derate_config_path=derate_config_path,
+    )
     total_time = tc_llm.calc_time_llm()
     topology_lines = util.network_topology_summary_training(exp_hw_config)
 
@@ -257,9 +270,9 @@ def _run_llm_training(exp_hw_config, exp_model_config, exp_dir, mode):
         log_message(warning_message)
 
 
-def _run_llm_inference(exp_hw_config, exp_model_config, exp_dir, mode):
+def _run_llm_inference(exp_hw_config, exp_model_config, exp_dir, mode, derate_config_path: Optional[str] = None):
     """Run LLM inference simulation including prefill + decode phases."""
-    tc_inf = TimeCalculationLLMInference(exp_hw_config, exp_model_config, mode, output_dir=exp_dir)
+    tc_inf = TimeCalculationLLMInference(exp_hw_config, exp_model_config, mode, output_dir=exp_dir, derate_config_path=derate_config_path)
 
     # Get total inference time (prefill + decode)
     inference_timing = tc_inf.calc_total_inference_time()
@@ -368,6 +381,7 @@ if __name__ == "__main__":
             exp_model_config_path=config_model_path,
             exp_dir=exp_dir,
             mode=mode,
+            derate_config_path=args.derate_config,
         )
     
     elif mode == "LSTM":

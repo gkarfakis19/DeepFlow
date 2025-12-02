@@ -670,6 +670,7 @@ def convert_deepflow_graph_to_chakra_et(
     graph_root,
     dp_size: int,
     output_dir: str,
+    derate_map: Optional[Dict[int, float]] = None,
 ) -> Tuple[str, List[int], str]:
     """Convert DeepFlow graph to AstraSim ET format by scheduling per stage and DP rank.
     This means converting the single DeepFlow DAG into a set of different AstraSim ET files.
@@ -749,6 +750,17 @@ def convert_deepflow_graph_to_chakra_et(
             os.makedirs(os.path.dirname(path), exist_ok=True)
             rank_traces[rank] = _RankTrace(stage, rank, path)
             stage_to_ranks[stage].append(rank)
+
+    derate_factors: Optional[Dict[int, float]] = None
+    if derate_map:
+        if dp_count != 1:
+            raise ValueError("derate_config is only supported when dp_count=1.")
+        derate_factors = {int(k): float(v) for k, v in derate_map.items()}
+        if set(derate_factors.keys()) != set(stage_ids):
+            raise ValueError(
+                f"derate_config entries must match hw_ids exactly; "
+                f"expected {sorted(stage_ids)}, got {sorted(derate_factors.keys())}"
+            )
 
     def rank_for(stage: int, dp_idx: int) -> int:
         return stage_to_ranks[stage][dp_idx]
@@ -1500,6 +1512,11 @@ def convert_deepflow_graph_to_chakra_et(
                             unique_deps.append(dep)
 
                     duration_sec = _compute_duration_seconds(task, dp_idx)
+                    if derate_factors is not None:
+                        factor = derate_factors.get(stage)
+                        if factor is None:
+                            raise ValueError(f"No derate factor found for hw_id {stage}")
+                        duration_sec *= factor
                     duration_micros = int(round(duration_sec * 1e6)) if duration_sec else 0
                     node_id = trace.next_id
                     comp_node = new_comp_node(
@@ -1652,6 +1669,7 @@ def run_astra_simulation_only_onepath(
     dp_override: Optional[int] = None,
     persist_artifacts: Optional[bool] = None,
     faulty_links_override: Optional[Sequence[Tuple[int, int, float]]] = None,
+    derate_map: Optional[Dict[int, float]] = None,
 ):
     """
     Run AstraSim simulation on DeepFlow graph and print results.
@@ -1661,6 +1679,7 @@ def run_astra_simulation_only_onepath(
         time_calc_obj: TimeCalculationLLM object with hw_config and dp attributes
         output_dir: Directory for temporary files and results
         faulty_links_override: Optional remapped faulty link list for this run
+        derate_map: Optional per-hw_id derate factors applied to compute nodes (flattened mode only)
     """
     print("\n" + "="*60)
     print("ASTRASIM SIMULATION RESULTS")
@@ -1690,6 +1709,7 @@ def run_astra_simulation_only_onepath(
             fwdbwd_root,
             dp_count,
             work_dir,
+            derate_map=derate_map,
         )
         rank_count = len(rank_ids)
         # Astrasim doesn't play well with only 1 rank.

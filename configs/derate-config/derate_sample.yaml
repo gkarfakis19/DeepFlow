@@ -1,0 +1,27 @@
+# Sample derate mapping for flattened AstraSim runs with dp=1 and a single
+# network dimension whose parallelisms are [tp, cp]. Axis order is tp -> cp,
+# so hw_id increases first along tp and then along cp (row-major grid):
+#   cp=0:  0  1  2  3
+#   cp=1:  4  5  6  7
+#   cp=2:  8  9 10 11
+#   cp=3: 12 13 14 15
+# If the parallelisms order is [cp, tp], the grid transposes (cp moves fastest).
+#
+# Factors >1.0 slow that device's compute nodes; 1.0 leaves them unchanged.
+# For other tp/cp sizes, extend the grid accordingly and keep ids contiguous.
+0: 1.02
+1: 1.00
+2: 1.00
+3: 1.00
+4: 1.05
+5: 1.00
+6: 1.00
+7: 1.00
+8: 0.98
+9: 1.00
+10: 1.00
+11: 1.00
+12: 1.10
+13: 1.00
+14: 1.00
+15: 1.00

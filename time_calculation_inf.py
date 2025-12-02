@@ -31,8 +31,8 @@ def convert_prefix(value: float) -> float:
 class TimeCalculationLLMInference(TimeCalculationLLM):
     """Inference-specialized facade for ``TimeCalculationLLM``."""
 
-    def __init__(self, hw_config, model_config, mode, output_dir: Optional[str] = None):
-        super().__init__(hw_config, model_config, mode, output_dir)
+    def __init__(self, hw_config, model_config, mode, output_dir: Optional[str] = None, derate_config_path: Optional[str] = None):
+        super().__init__(hw_config, model_config, mode, output_dir, derate_config_path=derate_config_path)
         if self.zero_stage >= 3 and self.dp > 1:
             raise ValueError("ZeRO-3 data parallelism is not supported for inference runs (dp_zero_stage must be <3 or dp=1).")
         self._raw_model_config = model_config
@@ -500,6 +500,7 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
             transformer_graph=self.transformer_graph,
             transformer_forward_root=self.transformer_forward_root,
             transformer_backward_root=self.transformer_backward_root,
+            derate_factors=self.derate_factors,
         )
         mode = self.execution_mode
         try:
