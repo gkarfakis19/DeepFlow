@@ -32,7 +32,9 @@ class TimeCalculationLLMInference(TimeCalculationLLM):
     """Inference-specialized facade for ``TimeCalculationLLM``."""
 
     def __init__(self, hw_config, model_config, mode, output_dir: Optional[str] = None, derate_config_path: Optional[str] = None):
-        super().__init__(hw_config, model_config, mode, output_dir, derate_config_path=derate_config_path)
+        if derate_config_path:
+            raise ValueError("derate_config is not supported for inference runs.")
+        super().__init__(hw_config, model_config, mode, output_dir, derate_config_path=None)
         if self.zero_stage >= 3 and self.dp > 1:
             raise ValueError("ZeRO-3 data parallelism is not supported for inference runs (dp_zero_stage must be <3 or dp=1).")
         self._raw_model_config = model_config

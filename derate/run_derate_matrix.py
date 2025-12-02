@@ -24,23 +24,11 @@ SCENARIOS = [
         "mode": "train",
     },
     {
-        "name": "derate_70b_inf",
-        "script": "derate_70b_inf.sh",
-        "derate_file": "derate_70b_inf.yaml",
-        "mode": "inference",
-    },
-    {
         "name": "derate_70b_longctx_train",
         "script": "derate_70b_longctx.sh",
         "derate_file": "derate_70b_longctx.yaml",
         "mode": "train",
     },
-    # {
-    #     "name": "derate_70b_longctx_inf",
-    #     "script": "derate_70b_longctx_inf.sh",
-    #     "derate_file": "derate_70b_longctx_inf.yaml",
-    #     "mode": "inference",
-    # },
 ]
 
 

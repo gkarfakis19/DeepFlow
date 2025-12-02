@@ -233,7 +233,9 @@ def run_LLM(
 
     llm_run_type = getattr(exp_model_config.model_config, "run_type", "training")
     if str(llm_run_type).lower() == "inference":
-        _run_llm_inference(exp_hw_config, exp_model_config, exp_dir, mode, derate_config_path=derate_config_path)
+        if derate_config_path:
+            raise ValueError("derate_config is not supported for inference runs.")
+        _run_llm_inference(exp_hw_config, exp_model_config, exp_dir, mode, derate_config_path=None)
         return
 
     _run_llm_training(exp_hw_config, exp_model_config, exp_dir, mode, derate_config_path=derate_config_path)
