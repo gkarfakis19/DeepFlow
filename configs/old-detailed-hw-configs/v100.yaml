@@ -91,7 +91,7 @@ tech_param:
       latency: 5e-6
       nominal_frequency: 3e9
       nominal_voltage: 1
-      nominal_energy_per_link: 1e-12
+      energy_per_bit: 1e-12
       nominal_area_per_link: 100e-6     #mm^2
       num_links_per_mm: 400
       threshold_voltage: 0.25
@@ -101,7 +101,7 @@ tech_param:
       latency: 5e-6
       nominal_frequency: 20e9
       nominal_voltage: 1.2
-      nominal_energy_per_link: 13e-12
+      energy_per_bit: 13e-12
       nominal_area_per_link: 0.045
       num_links_per_mm: 20     #Assuming 4 layers on PCB and 200 um pitch for high speed signalling
       threshold_voltage: 0.35
@@ -197,7 +197,7 @@ execution_backend:
   astra:
     backend: astra
     mode: hybrid  # hybrid | full_astrasim_hierarchical | full_astrasim_flattened
-    collectives:
+    collective_override:
       # Allowed values per op: auto | ring | direct | halvingDoubling | doubleBinaryTree
       # Note: leave to auto unless you have a specific reason to change it.
       all_gather: auto

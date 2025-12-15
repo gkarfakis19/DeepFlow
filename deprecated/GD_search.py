@@ -12,8 +12,7 @@ import config
 import util
 import perf
 
-import ruamel as _ruamel
-import ruamel.yaml as _yaml
+import yaml as _yaml
 
 import math
 
@@ -184,7 +183,7 @@ class GradientDescentSearch:
         random.seed(random_seed)
 
         with open(self.exp_config, "r") as f:
-            config_dict = _yaml.load(f, Loader=_ruamel.yaml.Loader)
+            config_dict = _yaml.safe_load(f)
 
         for param_class in self.parameters:
           if param_class == 'perimeter_breakdown': 
@@ -263,7 +262,7 @@ class GradientDescentSearch:
         
         config_dict = {}
         with open(exp_config, "r") as f:
-            config_dict = _yaml.load(f, Loader=_ruamel.yaml.Loader)
+            config_dict = _yaml.safe_load(f)
         
         config_dict['area_breakdown']['proc_chip_area_budget'] = self.chip_area_budget if self.chip_area_budget != -1 else config_dict['area_breakdown']['proc_chip_area_budget']#in mm^2
         for param_class in params:
@@ -305,7 +304,7 @@ class GradientDescentSearch:
             config_dict['system_hierarchy'][param] = self.system_hierarchy_params[param]
         
         with open(config_file, 'w') as yaml_file:
-            _yaml.dump(config_dict, yaml_file, default_flow_style=False)
+            _yaml.safe_dump(config_dict, yaml_file, default_flow_style=False, sort_keys=False)
       
         #print(config_file)
         #if self.debug:

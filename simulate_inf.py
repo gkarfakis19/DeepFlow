@@ -196,6 +196,8 @@ class DecodeGraph(Graph):
         (
             pipeline_graph,
             pipeline_root,
+            _,
+            _,
             transformer_graph,
             transformer_forward_root,
             transformer_backward_root,

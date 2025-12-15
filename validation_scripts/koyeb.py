@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 import os
-import sys
-import re
-import tempfile
-import subprocess
-import yaml
 import math
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Any
 import seaborn as sns
 
 import matplotlib.pyplot as plt
+
+from .validation_helpers import (
+  ValidationSpec,
+  parse_decode_time,
+  run_validation_suite,
+)
 
 
 # Llama-3.1-8B Instruct - A100 SXM (from Koyeb matrix, using actual Input/Output tokens)
@@ -70,64 +71,9 @@ sns.set()
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUN_PERF = os.path.join(PROJECT_ROOT, "run_perf.py")
-HARDWARE_CONFIG = os.path.join(PROJECT_ROOT, "configs/hardware-config/a100_80GB_no_parallelism.yaml")
-BASE_MODEL_CONFIG = os.path.join(PROJECT_ROOT, "configs/model-config/Llama3.1-8B_inf.yaml")
-
-def _load_yaml(path: str) -> dict:
-  with open(path, "r") as f:
-    return yaml.safe_load(f)
-
-def _write_yaml(path: str, data: dict) -> None:
-  with open(path, "w") as f:
-    yaml.safe_dump(data, f, sort_keys=False)
-
-
-def _update_model_config(base_cfg: dict, *, prefill_len: int, decode_len: int, batch_size: int) -> dict:
-  cfg = dict(base_cfg)  # shallow copy is fine; we reassign primitives
-  model_param = dict(cfg.get("model_param", {}))
-  # seq_len = prefill + decode
-  model_param["seq_len"] = int(prefill_len + decode_len)
-  model_param["decode_len"] = int(decode_len)
-  model_param["batch_size"] = int(batch_size)
-  cfg["model_param"] = model_param
-  return cfg
-
-
-def _run_deepflow_with_temp_model(prefill_len: int, decode_len: int, batch_size: int) -> Tuple[str, float]:
-  base_cfg = _load_yaml(BASE_MODEL_CONFIG)
-  updated_cfg = _update_model_config(base_cfg, prefill_len=prefill_len, decode_len=decode_len, batch_size=batch_size)
-  # if .tmp does not exist, make it
-  if not os.path.exists("./tmp"):
-    os.makedirs("./tmp")
-  fd, tmp_path = tempfile.mkstemp(prefix="koyeb_model_", suffix=".yaml", dir="./tmp")
-  os.close(fd)
-
-  try:
-    _write_yaml(tmp_path, updated_cfg)
-    cmd = [
-      sys.executable,
-      RUN_PERF,
-      "--hardware_config", HARDWARE_CONFIG,
-      "--model_config", tmp_path,
-    ]
-
-    proc = subprocess.run(cmd, cwd=PROJECT_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
-    output = proc.stdout
-
-    # Parse decode time from line: [prefill] time: Xs, [decode] time: Ys, [total] time: Zs
-    decode_time = None
-    m = re.search(r"\[prefill\]\s*time:\s*[0-9.]+s,\s*\[decode\]\s*time:\s*([0-9.]+)s,\s*\[total\]\s*time:\s*[0-9.]+s", output)
-    if m:
-      decode_time = float(m.group(1))
-
-    if decode_time is None:
-      raise RuntimeError(f"Failed to parse decode time from DeepFlow output: {output}")
-    return output, decode_time
-  finally:
-    try:
-      os.remove(tmp_path)
-    except Exception:
-      pass
+VALIDATION_CONFIG_ROOT = os.path.join(PROJECT_ROOT, "validation_scripts", "validation_configs")
+HARDWARE_CONFIG = os.path.join(VALIDATION_CONFIG_ROOT, "hardware-config/a100_80GB_no_parallelism.yaml")
+BASE_MODEL_CONFIG = os.path.join(VALIDATION_CONFIG_ROOT, "model-config/Llama3.1-8B_inf.yaml")
 
 
 def _collect_points_in_order(data: Dict[str, Dict[Tuple[int, int, int], Tuple[float, float]]]) -> List[Tuple[str, Tuple[int, int, int], Tuple[float, float]]]:
@@ -142,83 +88,173 @@ def _collect_points_in_order(data: Dict[str, Dict[Tuple[int, int, int], Tuple[fl
   return ordered
 
 
-def run_all_and_plot() -> None:
+def run_all_and_plot(*, enable_plot: bool = True, verbose: bool = True) -> Dict[str, Any]:
   experiments = _collect_points_in_order(KOYEB_DATA)
   if not experiments:
-    print("No experiments to run.")
-    return
+    if verbose:
+      print("No experiments to run.")
+    return {
+      "labels": [],
+      "expected_tokps": [],
+      "predicted_tokps": [],
+      "percent_errors": [],
+      "avg_error": float("nan"),
+      "avg_abs_error": float("nan"),
+      "plot_path": None,
+    }
 
+  log = print if verbose else (lambda *args, **kwargs: None)
   labels: List[str] = []
   expected_tokps: List[float] = []
   predicted_tokps: List[float] = []
   percent_errors: List[float] = []
+  specs: List[ValidationSpec] = []
 
-  for size, (prefill_len, decode_len, batch_size), (expected_decode_time_s, expected_tokps_agg) in experiments:
+  for idx, (size, (prefill_len, decode_len, batch_size), (expected_decode_time_s, expected_tokps_agg)) in enumerate(experiments):
     label = f"{size} bs={batch_size}"
-    print(f"\n=== Running {label} (prefill={prefill_len}, decode={decode_len}, batch={batch_size}) ===")
-    try:
-      console, decode_time_s = _run_deepflow_with_temp_model(prefill_len, decode_len, batch_size)
-      # Aggregate tokens per second using overall definition: total tokens / decode_time
-      total_tokens_agg = int(decode_len) * int(batch_size)  # dp=1 for no-parallelism hardware config
-      predicted_tokps_agg = float(total_tokens_agg) / float(decode_time_s) if decode_time_s > 0 else 0.0
+    metadata = {
+      "size": size,
+      "prefill_len": int(prefill_len),
+      "decode_len": int(decode_len),
+      "batch_size": int(batch_size),
+      "expected_tokps": float(expected_tokps_agg),
+      "expected_decode_time_s": float(expected_decode_time_s),
+    }
+    model_overrides = {
+      "model_param": {
+        "seq_len": int(prefill_len + decode_len),
+        "decode_len": int(decode_len),
+        "global_batch_size": int(batch_size),
+      },
+    }
+    specs.append(
+      ValidationSpec(
+        label=label,
+        model_overrides=model_overrides,
+        hardware_overrides=None,
+        metadata=metadata,
+        order=idx,
+      )
+    )
 
-      # Calculate percentage error
-      if expected_tokps_agg > 0:
-        pct_error = (predicted_tokps_agg - expected_tokps_agg) / expected_tokps_agg * 100.0
-      else:
-        pct_error = float("nan")
+  validation_results = run_validation_suite(
+    specs,
+    base_model_config_path=BASE_MODEL_CONFIG,
+    base_hardware_config_path=HARDWARE_CONFIG,
+    result_parser=parse_decode_time,
+    run_perf_path=RUN_PERF,
+  )
 
-      print(f"Predicted agg tok/s = {predicted_tokps_agg:.2f} (decode_time={decode_time_s:.2f}s)")
-      print(f"Expected agg tok/s  = {expected_tokps_agg:.2f}")
-      print(f"Error = {pct_error:+.2f}%")
-    except Exception as e:
-      print(f"ERROR running DeepFlow for {label}: {e}")
-      predicted_tokps_agg = float("nan")
-      pct_error = float("nan")
-
+  for result in validation_results:
+    meta = result.spec.metadata
+    label = result.spec.label
+    prefill_len = int(meta["prefill_len"])
+    decode_len = int(meta["decode_len"])
+    batch_size = int(meta["batch_size"])
+    expected_tokps_agg = float(meta["expected_tokps"])
     labels.append(label)
     expected_tokps.append(expected_tokps_agg)
+
+    if result.success:
+      decode_time_s = float(result.metrics.get("decode_time_s", float("nan")))
+    else:
+      decode_time_s = float("nan")
+
+    total_tokens_agg = int(decode_len) * int(batch_size)
+    if decode_time_s and decode_time_s > 0:
+      predicted_tokps_agg = float(total_tokens_agg) / float(decode_time_s)
+    else:
+      predicted_tokps_agg = float("nan")
+
+    if expected_tokps_agg > 0 and not math.isnan(predicted_tokps_agg):
+      pct_error = (predicted_tokps_agg - expected_tokps_agg) / expected_tokps_agg * 100.0
+    else:
+      pct_error = float("nan")
+
     predicted_tokps.append(predicted_tokps_agg)
     percent_errors.append(pct_error)
 
+    block_lines = [
+      f"\n=== Result {label} (prefill={prefill_len}, decode={decode_len}, batch={batch_size}) ===",
+    ]
+    if result.success and not math.isnan(predicted_tokps_agg):
+      block_lines.append(f"Predicted agg tok/s = {predicted_tokps_agg:.2f} (decode_time={decode_time_s:.2f}s)")
+      block_lines.append(f"Expected agg tok/s  = {expected_tokps_agg:.2f}")
+      block_lines.append(f"Error = {pct_error:+.2f}%")
+    else:
+      err_detail = result.error or "DeepFlow run failed"
+      block_lines.append(f"ERROR: {err_detail}")
+      if result.raw_output:
+        block_lines.append(result.raw_output.strip())
+    log("\n".join(block_lines))
+
   # Print summary statistics
-  print("\n" + "="*70)
-  print("SUMMARY")
-  print("="*70)
+  log("\n" + "="*70)
+  log("SUMMARY")
+  log("="*70)
   valid_errors = [e for e in percent_errors if not math.isnan(e)]
   if valid_errors:
     avg_error = sum(valid_errors) / len(valid_errors)
     avg_abs_error = sum(abs(e) for e in valid_errors) / len(valid_errors)
-    print(f"Average error:          {avg_error:+.2f}%")
-    print(f"Average absolute error: {avg_abs_error:.2f}%")
+    log(f"Average error:          {avg_error:+.2f}%")
+    log(f"Average absolute error: {avg_abs_error:.2f}%")
   else:
-    print("No valid error measurements.")
-  print("="*70)
+    avg_error = float("nan")
+    avg_abs_error = float("nan")
+    log("No valid error measurements.")
+  log("="*70)
 
-  # Plot
-  fig = plt.figure(figsize=(12, 6))
-  x = list(range(len(labels)))
-  plt.plot(x, predicted_tokps, marker="o", linestyle="-", color="#1f77b4", label="DeepFlow predicted tok/s (aggregate)")
-  plt.plot(x, expected_tokps, marker="o", linestyle="--", color="#ff7f0e", alpha=0.7, label="Expected tok/s (Koyeb)")
-  plt.xticks(x, labels, rotation=30, ha="right")
-  plt.ylabel("Tokens per second (aggregate)")
-  plt.title("Koyeb vs DeepFlow (single A100 SXM, Llama3.1-8B)")
-  plt.grid(True, linestyle=":", alpha=0.4)
-  plt.legend()
+  plot_path = None
+  if enable_plot:
+    # Plot
+    fig = plt.figure(figsize=(12, 6))
+    x = list(range(len(labels)))
+    plt.plot(x, predicted_tokps, marker="o", linestyle="-", color="#1f77b4", label="DeepFlow predicted tok/s (aggregate)")
+    plt.plot(x, expected_tokps, marker="o", linestyle="--", color="#ff7f0e", alpha=0.7, label="Expected tok/s (Koyeb)")
+    plt.xticks(x, labels, rotation=30, ha="right")
+    plt.ylabel("Tokens per second (aggregate)")
+    plt.title("Koyeb vs DeepFlow (single A100 SXM, Llama3.1-8B)")
+    plt.grid(True, linestyle=":", alpha=0.4)
+    plt.legend()
 
-  # Add note about large bs=32 datapoint
-  note_text = ( "X-axis is prefill length + batch size following Koyebs format (small = 512x512, medium = 1024x1024, large = 4096x1024)\n"
-                "For large bs=32 datapoint, we use PCIE data point, as SXM data is very noisy \n"
-               "on the official website (it's 2x slower than PCIE). You can change this in the code.")
-  fig.text(0.5, 0.02, note_text, ha='center', fontsize=9, style='italic', color='#555555', wrap=True)
+    # Add note about large bs=32 datapoint
+    note_text = ( "X-axis is prefill length + batch size following Koyebs format (small = 512x512, medium = 1024x1024, large = 4096x1024)\n"
+                  "For large bs=32 datapoint, we use PCIE data point, as SXM data is very noisy \n"
+                 "on the official website (it's 2x slower than PCIE). You can change this in the code.")
+    fig.text(0.5, 0.02, note_text, ha='center', fontsize=9, style='italic', color='#555555', wrap=True)
 
-  out_dir = os.path.join(PROJECT_ROOT, "output", "validation")
-  os.makedirs(out_dir, exist_ok=True)
-  out_path = os.path.join(out_dir, "koyeb_a100_sxm_no_parallelism.png")
-  plt.tight_layout(rect=[0, 0.06, 1, 1])  # Leave space at bottom for note
-  plt.savefig(out_path, dpi=160)
-  print(f"Saved plot to: {out_path}")
+    out_dir = os.path.join(PROJECT_ROOT, "output", "validation")
+    os.makedirs(out_dir, exist_ok=True)
+    plot_path = os.path.join(out_dir, "koyeb_a100_sxm_no_parallelism.png")
+    plt.tight_layout(rect=[0, 0.06, 1, 1])  # Leave space at bottom for note
+    plt.savefig(plot_path, dpi=160)
+    log(f"Saved plot to: {plot_path}")
+
+  return {
+    "labels": labels,
+    "expected_tokps": expected_tokps,
+    "predicted_tokps": predicted_tokps,
+    "percent_errors": percent_errors,
+    "avg_error": avg_error,
+    "avg_abs_error": avg_abs_error,
+    "plot_path": plot_path,
+  }
+
+
+def _parse_args():
+  import argparse
+  parser = argparse.ArgumentParser(description="Validate DeepFlow against Koyeb benchmarks.")
+  parser.add_argument("--no-plot", action="store_true", help="Skip generating the matplotlib plot/output file.")
+  parser.add_argument("--quiet", action="store_true", help="Suppress detailed per-experiment logs.")
+  return parser.parse_args()
 
 
 if __name__ == "__main__":
-  run_all_and_plot()
+  args = _parse_args()
+  results = run_all_and_plot(enable_plot=not args.no_plot, verbose=not args.quiet)
+  if args.quiet:
+    avg_abs = results["avg_abs_error"]
+    if math.isnan(avg_abs):
+      print("Average absolute error: NaN (no valid measurements)")
+    else:
+      print(f"Average absolute error: {avg_abs:.2f}%")

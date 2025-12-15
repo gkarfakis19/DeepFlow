@@ -10,17 +10,14 @@ from astrasim_lib import ensure_chakra_available
 import pandas as pd
 import yaml
 import shutil
+import util
+from util import log_message, flush_log_queue, extend_log
 
 import graphviz_async
 from tile import TiledGEMM, formatBytes
 from time_calculation import TimeCalculation
 from time_calculation_LLM import TimeCalculationLLM
 from time_calculation_inf import TimeCalculationLLMInference
-
-algByte = False  # algorithmic ops false
-proj = False  # consider projection layer, turn off for end-2-end validation, as baeline model does not have projection layer
-validating_v100 = True
-
 
 # Cache handling policy for AstraSim integration.
 # Options: "NO CACHE", "CACHE READONLY", "CACHE READWRITE"
@@ -48,6 +45,7 @@ def _report_total_wall_time() -> None:
         # Best-effort only
         pass
 
+atexit.register(flush_log_queue)
 atexit.register(_report_total_wall_time)
 
 def parse_arguments():
@@ -85,17 +83,17 @@ def _validate_astrasim_dependencies(hw_config) -> None:
 def _validate_network_topology(hw_config) -> None:
     backend = getattr(hw_config, "execution_backend", None)
     model = getattr(backend, "model", "analytical") if backend else "analytical"
-    network_topology = getattr(hw_config, "network_topology", None)
+    network_layout = getattr(hw_config, "network_layout", None)
 
-    if str(model).lower() == "analytical" and network_topology:
-        inter_topology = getattr(network_topology.inter, "topology", "ring")
-        intra_topology = getattr(network_topology.intra, "topology", "ring")
+    if str(model).lower() == "analytical" and network_layout:
+        for dim in getattr(network_layout, "dimensions", ()):
+            topo = str(getattr(dim, "topology_type", "ring")).lower()
+            if topo != "ring":
+                raise RuntimeError(
+                    "Non-ring network topologies are not supported in analytical mode. "
+                    "Only execution_backend.model='astra' (requires a valid AstraSim install) supports non-ring networks."
+                )
 
-        if str(inter_topology).lower() != "ring" or str(intra_topology).lower() != "ring":
-            raise RuntimeError(
-                "Non-ring network topologies are not supported in analytical mode. "
-                "Only execution_backend.model='astra' (requires a valid AstraSim install) supports non-ring networks."
-            )
 
 def run_LSTM(
     exp_hw_config_path,
@@ -238,6 +236,7 @@ def _run_llm_training(exp_hw_config, exp_model_config, exp_dir, mode):
     output_file = os.path.join(exp_dir, "LLM_training_results.txt")
     tc_llm = TimeCalculationLLM(exp_hw_config, exp_model_config, mode, output_dir=exp_dir)
     total_time = tc_llm.calc_time_llm()
+    topology_lines = util.network_topology_summary_training(exp_hw_config)
 
     with open(output_file, "a+") as handle:
         handle.write("\n\n==============================================\n")
@@ -246,13 +245,16 @@ def _run_llm_training(exp_hw_config, exp_model_config, exp_dir, mode):
         handle.write("Execution Mode: {}\n".format(tc_llm.execution_mode.value))
         handle.write("Total Time: {0:.8f}\n".format(total_time))
         handle.write("\n")
-        handle.write("For more info, turn on debug flags. See examples/llm_astra_inference_debug_graphviz.sh")
+        handle.write("For more info, turn on debug flags. See examples/llm_astra_inference_debug_graphviz.sh\n")
+        handle.write("\n".join(topology_lines))
+        handle.write("\n")
 
-    print("Training time for batch: {:.2f}s".format(tc_llm.get_time()))
-    print("LLM training results written to {}".format(output_file))
+    log_message("Training time for batch: {:.2f}s".format(tc_llm.get_time()), category="results")
+    extend_log(topology_lines, category="network")
+    log_message("LLM training results written to {}".format(output_file), category="results")
     warning_message = tc_llm.memory_capacity_warning()
     if warning_message:
-        print(warning_message)
+        log_message(warning_message)
 
 
 def _run_llm_inference(exp_hw_config, exp_model_config, exp_dir, mode):
@@ -264,20 +266,22 @@ def _run_llm_inference(exp_hw_config, exp_model_config, exp_dir, mode):
     total_time = inference_timing["total_inference_time"]
     decode_rates = inference_timing.get("decode_tokens_per_s") or {}
 
-    print(
+    log_message(
         "LLM inference time: {:.2f}s (mode={})".format(
             total_time, tc_inf.execution_mode.value
-        )
+        ),
+        category="results",
     )
-    print(
+    log_message(
         "LLM time to first token: {:.2f}s".format(
             inference_timing["time_to_first_token"],
-        )
+        ),
+        category="results",
     )
     dp_replicas = max(1, getattr(tc_inf, "dp", 1))
     batch_size = getattr(tc_inf, "batch_size", 1)
     if dp_replicas > 1:
-        print(f"Data parallel replicas: {dp_replicas}")
+        log_message(f"Data parallel replicas: {dp_replicas}", category="results")
     if decode_rates:
         # decode_rates are per-generation rates (tokens per second per generation)
         start_gen_rate = decode_rates.get("start", 0.0)
@@ -286,17 +290,18 @@ def _run_llm_inference(exp_hw_config, exp_model_config, exp_dir, mode):
         mid_step = int(decode_rates.get("midpoint_step", 0.0))
         
         # Print per-generation rates
-        print(
+        log_message(
             "Decode sequences/s: start={:.2f}, mid(token {})={:.2f}, end={:.2f}".format(
                 start_gen_rate,
                 mid_step,
                 mid_gen_rate,
                 end_gen_rate,
-            )
+            ),
+            category="results",
         )
 
         # Print aggregate decode throughput (with batch_size and dp multipliers)
-        print(
+        log_message(
             "Aggregate decode throughput tok/s (batch={}, dp={}): start={:.2f}, mid(token {})={:.2f}, end={:.2f}".format(
                 batch_size,
                 dp_replicas,
@@ -304,8 +309,11 @@ def _run_llm_inference(exp_hw_config, exp_model_config, exp_dir, mode):
                 mid_step,
                 mid_gen_rate * batch_size * dp_replicas,
                 end_gen_rate * batch_size * dp_replicas,
-            )
+            ),
+            category="results",
         )
+
+    topology_lines = util.network_topology_summary_inference(exp_hw_config)
 
     output_path = os.path.join(exp_dir, "LLM_inference_results.txt")
     os.makedirs(exp_dir, exist_ok=True)
@@ -329,12 +337,15 @@ def _run_llm_inference(exp_hw_config, exp_model_config, exp_dir, mode):
             handle.write(f"Decode Generations per Second: start={start_gen_rate:.2f}, mid(token {mid_step})={mid_gen_rate:.2f}, end={end_gen_rate:.2f}\n")
             handle.write(f"Aggregate Decode Throughput Tok/s (batch={batch_size}, dp={dp_replicas}): start={start_gen_rate * batch_size * dp_replicas:.2f}, mid(token {mid_step})={mid_gen_rate * batch_size * dp_replicas:.2f}, end={end_gen_rate * batch_size * dp_replicas:.2f}\n")
         handle.write("\n")
-        handle.write("For more info, turn on debug flags. See examples/llm_astra_inference_debug_graphviz.sh")
+        handle.write("For more info, turn on debug flags. See examples/llm_astra_inference_debug_graphviz.sh\n")
+        handle.write("\n".join(topology_lines))
+        handle.write("\n")
 
-    print("LLM inference results written to {}".format(output_path))
+    extend_log(topology_lines, category="network")
+    log_message("LLM inference results written to {}".format(output_path), category="results")
     warning_message = tc_inf.memory_capacity_warning()
     if warning_message:
-        print(warning_message)
+        log_message(warning_message)
 
 if __name__ == "__main__":
     args = parse_arguments()
@@ -352,7 +363,6 @@ if __name__ == "__main__":
     os.makedirs(exp_dir, exist_ok=True)
     
     if mode == "LLM":
-        print("Using LLM parameters for computation...")
         run_LLM(
             exp_hw_config_path=config_hardware_path,
             exp_model_config_path=config_model_path,
@@ -361,7 +371,7 @@ if __name__ == "__main__":
         )
     
     elif mode == "LSTM":
-        print("Using LSTM parameters for computation...")
+        log_message("Using LSTM parameters for computation...")
         run_LSTM(
             exp_hw_config_path=config_hardware_path,
             exp_model_config_path=config_model_path,
@@ -370,7 +380,7 @@ if __name__ == "__main__":
         
         )
     elif mode == "GEMM":
-        print("Using GEMM parameters for computation...")
+        log_message("Using GEMM parameters for computation...")
         run_GEMM(
             exp_hw_config_path=config_hardware_path,
             exp_model_config_path=config_model_path,
@@ -379,3 +389,7 @@ if __name__ == "__main__":
         )
     else:
         print("Invalid mode selected. Please choose 'LLM', 'LSTM', or 'GEMM'.")
+        flush_log_queue()
+        sys.exit(1)
+
+    flush_log_queue()

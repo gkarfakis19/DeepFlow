@@ -1,0 +1,177 @@
+sw_param:
+  full_recomputation: false # Enable full activation recompute during backward instead of selective recomputation
+  kernel_launch_overhead: 5e-6
+  dp_zero_stage: 0
+  precision:
+    tensor_format: bf16
+    mixed_precision: true
+    param_storage_mode: as_tensor_format
+    kv_cache: as_tensor_format
+  h2d_bandwidth: -1
+
+  # DP gradient sync frequency: every_mb (default) or last_mb (sync only on final microbatch; ZeRO-3 stays per-mb)
+  dp_microbatch: last_mb
+tech_param:
+  core:
+    operating_frequency: 1.41e9
+    num_bundles: 108
+    nominal_flop_rate_per_mcu: 512
+    nominal_energy_per_flop: 1.8e-13
+    nominal_voltage: 0.8
+    threshold_voltage: 0.6
+    margin_voltage: 0.1
+    operating_area_per_mcu: 1.0
+    num_mcu_per_bundle: 4
+    FMA_d1: 8
+    FMA_d2: 4
+    dataflow: best
+    util: 1.0
+  DRAM:
+    size: 80 GB
+    bandwidth: 1986 GB
+    dynamic_energy_per_bit: 4.5e-12
+    static_power_per_bit: 0.1
+    area_per_bit: 0.1
+    stack_capacity: 80
+    area_per_stack: 0.1
+    latency: 100e-9
+    mem_ctrl_area: 0.1
+    nominal_voltage: 0.8
+    threshold_voltage: 0.6
+    margin_voltage: 0.1
+    num_links_per_mm: 1
+    num_links_per_stack: 1
+    max_voltage: 0.8
+    util: 1
+  SRAM-L2:
+    size: 40 MB
+    bandwidth: 7050 GB
+    dynamic_energy_per_bit: 130e-15
+    static_power_per_bit: 0.1
+    area_per_bit: 0.1
+    bank_capacity: 1.0
+    controller_area_per_link: 0.1
+    latency: 0
+    overhead: 0.1
+    util: 1
+  SRAM-L1:
+    size: 20736 KB
+    bandwidth: 18 TB
+    dynamic_energy_per_bit: 130e-15
+    static_power_per_bit: 0.1
+    area_per_bit: 0.1
+    bank_capacity: 1.0
+    controller_area_per_link: 0.1
+    latency: 0
+    overhead: 0.1
+    util: 1
+  SRAM-R:
+    size: 27 MB
+    bandwidth: 122 TB
+    dynamic_energy_per_bit: 110e-15
+    static_power_per_bit: 0.1
+    area_per_bit: 0.1
+    bank_capacity: 1.0
+    controller_area_per_link: 0.1
+    latency: 0
+    overhead: 0.1
+    util: 1
+
+memory_hierarchy:
+  l0:
+    type: SRAM-R
+    scope: mcu
+  l1:
+    type: SRAM-L1
+    scope: mcu-bundle
+  l2:
+    type: SRAM-L2
+    scope: global
+  l3:
+    type: DRAM
+    scope: global
+
+parallelism:
+  dp: 1
+  tp: 4
+  tp_sp: false
+  cp: 4
+  lp: 1
+  mb: 1
+
+network:
+  dimensions:
+    - id: dim0
+      label: mesh2d_cluster
+      size: auto
+      topology:
+        type: Torus2D
+        bandwidth: 100 GB
+        latency: 5e-6
+        energy_per_bit: 8e-12
+        util: 1.0
+        optimize_2dmap: true
+      parallelisms: [tp, cp, lp]
+    - id: dim1
+      label: pipeline_ring
+      size: auto
+      topology:
+        type: Ring
+        bandwidth: 25 GB
+        latency: 5e-6
+        energy_per_bit: 8e-12
+        util: 1.0
+      parallelisms: [dp]
+
+  overlap:
+    # fraction of TP+SP compute that can overlap TP/SP comm
+    tp_sp_overlap: 0.63
+    # fraction of TP compute that can overlap TP comm
+    tp_overlap: 0.6
+    # fraction of CP comm that can overlap CP compute
+    cp_overlap: 0.0
+power_breakdown:
+  TDP: 400
+  core: 200
+  DRAM: 100
+  L2: 30
+  L1: 20
+  reg_mem: 10
+  network:
+    inter_node: 5
+    intra_node: 5
+
+area_breakdown:
+  proc_chip_area_budget: 1.0
+  core: 0.5
+  DRAM: 0.1
+  L2: 0.1
+  L1: 0.1
+  reg_mem: 0.1
+  device_area_budget: 1.0
+  network:
+    inter_node: 0.1
+    intra_node: 0.1
+
+perimeter_breakdown:
+  DRAM: 0.1
+  inter_node: 0.1
+  intra_node: 0.1
+
+execution_backend:
+  model: astra
+  astra:
+    backend: astra
+    mode: full_astrasim_flattened
+    collectives:
+      all_gather: auto
+      all_reduce: auto
+      reduce_scatter: auto
+      all_to_all: auto
+    sys_options:
+      endpoint_delay: 5
+      active_chunks_per_dimension: 8
+      preferred_dataset_splits: 2
+
+inference:
+  kvcache_type: hbm_only

@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - llm-dev
+  pull_request:
+    
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install AstraSim system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-11 g++-11 make cmake \
+            clang-format \
+            libboost-dev libboost-program-options-dev \
+            libprotobuf-dev protobuf-compiler \
+            openmpi-bin openmpi-doc libopenmpi-dev
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v2
+
+      - name: Sync Python dependencies
+        run: uv sync
+
+      - name: Determine AstraSim commit
+        run: echo "ASTRASIM_SHA=$(git -C astra-sim rev-parse HEAD)" >> $GITHUB_ENV
+
+      - name: Restore AstraSim build cache
+        id: ascache
+        uses: actions/cache@v4
+        with:
+          path: astra-sim/build/astra_analytical/build
+          key: astra-${{ env.ASTRASIM_SHA }}
+
+      - name: Build AstraSim (cache miss)
+        if: steps.ascache.outputs.cache-hit != 'true'
+        run: |
+          chmod +x scripts/install_astrasim.sh
+          scripts/install_astrasim.sh
+
+      - name: Run pytest
+        env:
+          DEEPFLOW_VALIDATION_WORKERS: "1"
+        run: uv run pytest

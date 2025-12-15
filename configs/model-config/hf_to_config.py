@@ -206,7 +206,8 @@ def _build_yaml_config(cfg: dict, args: argparse.Namespace, model_type: str) -> 
             "run_type": args.run_type,
             "tied_embeddings": tied_embeddings,
             "model_type": model_type,
-            "batch_size": args.batch_size,
+            "global_batch_size": args.global_batch_size,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
             "seq_len": int(seq_len),
             "decode_len": args.decode_len,
             "hidden_dim": int(hidden_dim),
@@ -226,7 +227,13 @@ def parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("model_id", help="Hugging Face model identifier, e.g. meta-llama/Llama-2-7b-hf")
     parser.add_argument("--revision", default="main", help="Model revision/branch to use (default: main)")
-    parser.add_argument("--batch-size", type=int, default=1, help="Training batch size to encode in the config (default: 1)")
+    parser.add_argument("--global-batch-size", type=int, default=1, help="Training global batch size to encode in the config (default: 1)")
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=1,
+        help="Number of gradient accumulation micro-steps per optimizer update (default: 1)",
+    )
     parser.add_argument("--seq-len", type=int, default=None, help="Override sequence length. Defaults to HF config max position embeddings if not provided")
     parser.add_argument("--decode-len", type=int, default=0, help="Decode sequence length (default: 0)")
     parser.add_argument("--run-type", default="training", help="Config run_type field ('training' or 'inference')")

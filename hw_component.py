@@ -1,15 +1,11 @@
 import math
+from typing import Tuple
+
 import numpy as np
 import util
-from topology_hack import Topology
 
 kilo = 1024.0
 giga = 1024.0 * 1024.0 * 1024.0
-
-
-class System:
-    def __init__(self, exp_config):
-        self.num_nodes_per_wafer = exp_config.system_hierarchy.num_nodes_per_wafer
 
 
 class Base:
@@ -63,6 +59,29 @@ class Memory(Base):
     def getTileDims(self):
         return self.getPower2TileDims()
         # return self.getArbitraryTileDims(self):
+
+    def calc_waves_per_sm(self, M, K, N, m, k, n):
+        bytes_required = self.precision * (m * k + k * n)
+        grid_size = math.ceil(M / m) * math.ceil(N / n)
+
+        compute_time = 2 * (m * n * k) / 312e12
+        load_time = (self.precision * (m * k + k * n)) / (7050 * 1024 ** 3)
+
+        stages = 3 if load_time < compute_time else 5
+        smem_required = bytes_required * stages
+        if smem_required > self.size_per_bundle:
+            return -1
+        
+        reg_accum = m * n
+        reg_input = 16 * (m + n)
+        if reg_accum + reg_input > 65536:
+            return -1
+
+        smem_blocks = self.size_per_bundle // smem_required
+        reg_blocks = 65536 // (reg_accum + reg_input)
+
+        return grid_size / min(smem_blocks, reg_blocks) / 108
+
 
     def getGEMMBasedTileDims(self, M, K, N):
         m_dims = [ M >> i for i in range(M.bit_length()) if (M >> i) >= 1 ]
@@ -708,188 +727,48 @@ class SRAM(Memory):
 class Network(Base):
     def __init__(self, exp_config):
         super().__init__(exp_config)
-        self.intra_network = SubNetwork(
-            exp_config,
-            exp_config.tech_config.network.intra_node,
-            exp_config.power_breakdown.network.intra_node,
-            exp_config.area_breakdown.network.intra_node,
-            "intra",
-        )
-        self.inter_network = SubNetwork(
-            exp_config,
-            exp_config.tech_config.network.inter_node,
-            exp_config.power_breakdown.network.inter_node,
-            exp_config.area_breakdown.network.inter_node,
-            "inter",
-        )
+        layout = getattr(exp_config, "network_layout", None)
+        if layout is None:
+            raise ValueError("hardware config is missing network layout information")
+        self.layout = layout
+        self.energies_per_bit = [
+            float(getattr(dim, "energy_per_bit", 0.0))
+            for dim in layout.dimensions
+        ]
 
     def calcThroughput(self):
-        inter_throughput = self.inter_network.calcThroughput()
-        intra_throughput = self.intra_network.calcThroughput()
-
-        return intra_throughput, inter_throughput
+        primary = self.layout.primary_dimension()
+        if primary is None:
+            return 0.0, 0.0
+        bw = float(primary.effective_bandwidth)
+        return bw, bw
 
     def calcLatency(self):
-        inter_latency = self.inter_network.latency
-        intra_latency = self.intra_network.latency
+        primary = self.layout.primary_dimension()
+        if primary is None:
+            return 0.0, 0.0
+        latency = float(primary.latency)
+        return latency, latency
 
-        return intra_latency, inter_latency
+    def get_link(self, parallelism: str) -> Tuple[float, float]:
+        bandwidth, latency = self.layout.link_for_parallelism(parallelism)
+        return float(bandwidth), float(latency)
+
+    def dimension_for_parallelism(self, parallelism: str):
+        return self.layout.dimension_for_parallelism(parallelism)
 
     def printStats(self, f):
-        self.inter_network.printStats(f, "inter")
-        self.intra_network.printStats(f, "intra")
-
-
-class SubNetwork(Base):
-    def __init__(
-        self, exp_config, net_config, power_breakdown, area_breakdown, netLevel
-    ):
-        super().__init__(exp_config)
-        self.tot_power = power_breakdown  # * self.TDP
-        self.tot_area = area_breakdown  # * self.proc_chip_area_budget
-        # TODO: Rename core_perimeter to proc_chip_perimeter
-        self.latency = net_config.latency
-        self.nominal_freq = net_config.nominal_freq
-        self.nominal_voltage = net_config.nominal_voltage
-        self.nominal_energy_per_link = net_config.nominal_energy_per_link
-        self.nominal_area_per_link = net_config.nominal_area_per_link
-        self.threshold_voltage = net_config.threshold_voltage
-        self.margin_voltage = net_config.margin_voltage
-        self.num_links_per_mm = net_config.num_links_per_mm
-        self.util = net_config.util
-        self.config_operating_frequency = net_config.operating_frequency  # Master parameter
-        self.config_bandwidth = net_config.bandwidth  # Master parameter - overrides all
-        self.inter = True if netLevel == "inter" else False
-        self.intra = True if netLevel == "intra" else False
-
-        inter_frac = exp_config.perimeter_breakdown.inter_node
-        intra_frac = exp_config.perimeter_breakdown.intra_node
-        perimeter_fraction = inter_frac if self.inter else intra_frac
-        self.tot_perimeter = perimeter_fraction * self.core_perimeter
-        self.num_links = int(
-            min(
-                self.tot_area / self.nominal_area_per_link,
-                perimeter_fraction * self.core_perimeter * self.num_links_per_mm,
-            )
-        )
-
-        self.throughput = 0
-        self.operating_freq = 0
-        self.operating_voltage = 0
-
-        # If bandwidth is explicitly set, use it directly (master parameter - overrides everything)
-        if self.config_bandwidth:
-            self.throughput = self.config_bandwidth * self.util
-            # Set nominal values when bandwidth is overridden (actual freq/voltage don't matter)
-            self.operating_freq = self.nominal_freq
-            self.operating_voltage = self.nominal_voltage
-        elif self.num_links > 0:
-            self.calcOperatingVoltageFrequency()
-            # Calculate throughput based on topology
-            # 4 edges for intra (mesh), 1 edge for inter (mesh extension)
-            degree = 4 if self.intra else 1
-            self.throughput = (self.num_links * self.operating_freq * self.util) / (8 * degree)
-
-        # self.energy_per_bit             = self.calcEnergyPerBit()
-
-    def calcOperatingVoltageFrequency(self):
-        # If operating_frequency is explicitly set, use it directly (master parameter)
-        if self.config_operating_frequency:
-            self.operating_freq = self.config_operating_frequency
-            self.operating_voltage = self.nominal_voltage  # Assume nominal voltage when freq is overridden
-            return
-
-        # Otherwise, calculate from voltage scaling based on power constraints
-        self.nominal_power = (
-            self.nominal_energy_per_link * self.num_links * self.nominal_freq
-        )
-        # minimum voltage to meet the power constraint
-        self.operating_voltage = self.solve_poly(
-            p0=1,
-            p1=-2 * self.threshold_voltage,
-            p2=self.threshold_voltage**2,
-            p3=-1
-            * self.tot_power
-            / self.nominal_power
-            * self.nominal_voltage
-            * (self.nominal_voltage - self.threshold_voltage) ** 2,
-        )
-        # operating frequency at minimum voltage
-        self.operating_freq = self.nominal_freq * (
-            (
-                (self.operating_voltage - self.threshold_voltage) ** 2
-                / (self.operating_voltage)
-            )
-            / (
-                (self.nominal_voltage - self.threshold_voltage) ** 2
-                / self.nominal_voltage
-            )
-        )
-        self.frequency_scaling_factor = 1
-        if self.operating_voltage < (self.threshold_voltage + self.margin_voltage):
-            self.scaled_voltage = self.threshold_voltage + self.margin_voltage
-            self.frequency_scaling_factor = (
-                self.operating_voltage / self.scaled_voltage
-            ) ** 2
-
-        self.operating_freq = self.frequency_scaling_factor * self.operating_freq
-
-    def calcEnergyPerBit(self):
-        self.operating_energy_per_link = (
-            self.nominal_energy_per_link
-            * (self.operating_voltage / self.nominal_voltage) ** 2
-        )
-        energy_per_bit = self.operating_energy_per_link
-        return energy_per_bit
-
-    # Return P2P bw
-    def calcThroughput(self):
-        return self.throughput
-
-    def printStats(self, f, name):
-        self.calcEnergyPerBit()
-        self.eff_power = (
-            self.num_links * self.operating_freq * self.operating_energy_per_link
-        )
-        self.eff_area = self.num_links * self.nominal_area_per_link
-        self.eff_perimeter = self.num_links / self.num_links_per_mm
-
-        if self.eff_power > 0 and self.eff_area > 0:
+        for dim in self.layout.dimensions:
             f.write("\n\n=============\n")
-            f.write("Network: {}\n".format(name))
+            f.write(f"Network Dimension: {dim.label} ({dim.id})\n")
             f.write("=============\n")
+            f.write(f"Topology: {dim.topology_type}\n")
+            f.write(f"Size: {dim.size}\n")
             f.write(
-                "operating_voltage: {0:.2f}, operating_freq: {1:.2f} (Ghz)\n".format(
-                    self.operating_voltage, self.operating_freq / 1e9
+                "Effective Bandwidth: {0:.4f} (GB/s)\n".format(
+                    dim.effective_bandwidth / 1024 / 1024 / 1024
                 )
             )
-            f.write(
-                "voltage_lowerbound: {0:.2f}\n".format(
-                    self.threshold_voltage + self.margin_voltage
-                )
-            )
-            f.write("#links: {0:5d}\n".format(self.num_links))
-            if self.tot_area != 0:
-                f.write(
-                    "eff_area: {0:.2f} (mm2), tot_area: {1:.2f} (mm2), util: {2:.2f}%\n".format(
-                        self.eff_area,
-                        self.tot_area,
-                        self.eff_area / self.tot_area * 100,
-                    )
-                )
-            if self.tot_power != 0:
-                f.write(
-                    "eff_power: {0:.2f} (watt), tot_power: {1:.2f} (watt), util: {2:.2f}%\n".format(
-                        self.eff_power,
-                        self.tot_power,
-                        self.eff_power / self.tot_power * 100,
-                    )
-                )
-            if self.tot_perimeter != 0:
-                f.write(
-                    "eff_perimeter: {0:.2f} (mm), tot_perimeter: {1:.2f} (mm), util: {2:.2f}%\n".format(
-                        self.eff_perimeter,
-                        self.tot_perimeter,
-                        self.eff_perimeter / self.tot_perimeter * 100,
-                    )
-                )
+            f.write(f"Latency: {dim.latency * 1e9:.4f} (ns)\n")
+            f.write(f"Util: {dim.util:.4f}\n")
+            f.write(f"Parallelisms: {', '.join(dim.parallelisms) or 'None'}\n")

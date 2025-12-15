@@ -1,0 +1,20 @@
+model_param:
+  mode: "LLM"
+  run_type: "training"
+  tied_embeddings: true
+  model_type: "llama"
+  global_batch_size: 8
+  gradient_accumulation_steps: 1
+  seq_len: 32
+  hidden_dim: 512
+  attention:
+    attention_type: "mha"
+    num_heads: 8
+    kv_heads: 8
+    use_flashattention: false
+    attention_tile_size: 16
+  num_experts: 1
+  top_k: 1
+  intermediate_size: 2048
+  vocab_size: 8192
+  num_layers: 2

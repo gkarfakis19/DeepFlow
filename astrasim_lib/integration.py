@@ -6,9 +6,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import time
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .bootstrap import ensure_chakra_available
 from .config_generation import (
@@ -33,6 +35,8 @@ from .et_utils import (
 )
 
 ensure_chakra_available()
+
+_DEFAULT_ASTRA_CACHE_DIR = os.path.abspath("./astra_cache")
 
 _CACHE_MODES = {
     "NO_CACHE",
@@ -131,6 +135,19 @@ def _hash_file_bundle(paths: Iterable[str]) -> str:
                     break
                 h.update(chunk)
     return h.hexdigest()
+
+
+def _path_within_dir(path: Optional[str], directory: str) -> bool:
+    """Return True when ``path`` is within ``directory``."""
+
+    if not path:
+        return False
+    try:
+        path_abs = os.path.abspath(path)
+        dir_abs = os.path.abspath(directory)
+        return os.path.commonpath([path_abs, dir_abs]) == dir_abs
+    except (OSError, ValueError):
+        return False
 
 
 def _load_cache(cache_path: str) -> Dict[str, Any]:
@@ -315,158 +332,216 @@ def run_cache_astrasim(
     manifest_json_path: Optional[str] = None,
     workload_prefix: Optional[str] = None,
     comm_group_json: Optional[str] = None,
+    axes_filter: Optional[Sequence[str]] = None,
+    transform_2d_to_1d: bool = False,
+    files = None,
 ) -> Tuple[List[float], float]:
     """Run AstraSim with caching to avoid recomputation when inputs match."""
 
     if isinstance(hw_obj, str):
         raise TypeError("run_cache_astrasim expects a parsed HWConfig object, not a path")
 
-    override_dir = os.environ.get("ASTRA_CACHE_DIR")
-    if override_dir:
-        astra_config_dir = override_dir
-        cache_path = os.path.join(override_dir, "cache.json")
+    comm_lower = str(comm).lower()
 
     cache_mode = _cache_mode()
     allow_read = cache_mode in {"CACHE_READONLY", "CACHE_READWRITE"}
     allow_write = cache_mode == "CACHE_READWRITE"
 
-    if allow_read or allow_write:
-        ensure_cache_file_exists(cache_path)
-
-    (intra_ib_bps, intra_ll_s), _ = compute_intra_inter_ib_ll_from_hw(hw_obj)
-    if not intra_ib_bps or intra_ib_bps <= 0 or not intra_ll_s or intra_ll_s <= 0:
-        raise ValueError("Invalid intra-node IB/LL computed from HW config")
-    ib_gbps = round((intra_ib_bps) / float(1 << 30), 6)
-    ll_ns = round(intra_ll_s * 1e9, 3)
-    topo = derive_topology_from_hw(hw_obj)
-    colls = _collectives_from_hw(hw_obj, topo)
-    sys_opts_sig = _sys_options_from_hw(hw_obj)
-
-    sig: Dict[str, Any] = {
-        "comm": comm.lower(),
-        "npus": int(npus_count),
-        "size_bytes": int(size_bytes),
-        "topology": topo,
-        "physical_topology": topo,
-        "ib_gbps": ib_gbps,
-        "ll_ns": ll_ns,
-        "collectives": colls,
-        "backend": "analytical",
-    }
-    if sys_opts_sig is not None:
-        sig["sys_options"] = sys_opts_sig
-    if manifest_json_path:
-        sig["multinode"] = True
-    canonical = _canonical_sig(sig)
-
-    files = generate_astrasim_configs_from_hw(hw_obj, out_dir=astra_config_dir, npus_count=npus_count)
-
-    if workload_prefix:
-        pass
-    elif not manifest_json_path:
-        label = size_label(size_bytes)
-        base_dir = os.path.join(astra_config_dir, "workload", comm.lower(), f"{npus_count}npus_{label}")
-        workload_prefix = os.path.join(base_dir, f"{comm.lower()}_{label}")
-        expected = [f"{workload_prefix}.{r}.et" for r in range(npus_count)]
-        if not all(os.path.exists(p) for p in expected):
-            generate_workload_et(comm, npus_count, size_bytes, astra_config_dir=astra_config_dir)
+    temp_cache_dir: Optional[str] = None
+    if cache_mode == "NO_CACHE":
+        temp_cache_dir = tempfile.mkdtemp(prefix="astrasim_cache_")
+        astra_config_dir = temp_cache_dir
+        cache_path = os.path.join(temp_cache_dir, "cache.json")
     else:
-        workload_prefix = os.path.splitext(manifest_json_path)[0]
+        override_dir = os.environ.get("ASTRA_CACHE_DIR")
+        if override_dir:
+            astra_config_dir = override_dir
+            cache_path = os.path.join(override_dir, "cache.json")
+        if allow_read or allow_write:
+            ensure_cache_file_exists(cache_path)
 
-    remote_mem_path = get_remote_memory_path()
+    ephemeral_paths: List[str] = []
 
-    if manifest_json_path:
-        bundle_list: List[str] = [manifest_json_path]
-        for path in (files["system_json"], files["network_yaml"]):
-            if path and os.path.exists(path):
-                bundle_list.append(path)
-        if remote_mem_path and os.path.exists(remote_mem_path):
-            bundle_list.append(remote_mem_path)
-        if comm_group_json and os.path.exists(comm_group_json):
-            bundle_list.append(comm_group_json)
-        cache_key = _hash_file_bundle(bundle_list)
-    else:
-        cache_key = _hash_sig(canonical)
+    try:
+        (intra_ib_bps, intra_ll_s), _ = compute_intra_inter_ib_ll_from_hw(hw_obj)
+        if not intra_ib_bps or intra_ib_bps <= 0 or not intra_ll_s or intra_ll_s <= 0:
+            raise ValueError("Invalid intra-node IB/LL computed from HW config")
+        ib_gbps = round((intra_ib_bps) / float(1 << 30), 6)
+        ll_ns = round(intra_ll_s * 1e9, 3)
+        topo = derive_topology_from_hw(hw_obj)
+        colls = _collectives_from_hw(hw_obj, topo)
+        sys_opts_sig = _sys_options_from_hw(hw_obj)
+        axes_filter_tuple: Optional[Tuple[str, ...]] = tuple(axes_filter) if axes_filter else None
 
-    if allow_read:
-        cache = _load_cache(cache_path)
-        entry = cache.get(cache_key) if cache else None
-        if entry:
-            cached_per = entry.get("per_node_sec", [])
-            cached_max = float(entry.get("max_sec", 0.0))
-            if cached_per and cached_max > 0 and len(cached_per) == int(npus_count) and all((t > 0 for t in cached_per)):
-                if str(comm).lower() == "graph":
+        cache_dir_abs = os.path.abspath(astra_config_dir)
+        ephemeral_configs = (
+            files is None
+            and comm_lower != "graph"
+            and cache_dir_abs == _DEFAULT_ASTRA_CACHE_DIR
+        )
+
+        sig: Dict[str, Any] = {
+            "comm": comm_lower,
+            "npus": int(npus_count),
+            "size_bytes": int(size_bytes),
+            "topology": topo,
+            "physical_topology": topo,
+            "ib_gbps": ib_gbps,
+            "ll_ns": ll_ns,
+            "collectives": colls,
+            "backend": "analytical",
+        }
+        if sys_opts_sig is not None:
+            sig["sys_options"] = sys_opts_sig
+        if manifest_json_path:
+            sig["multinode"] = True
+        if axes_filter_tuple is not None:
+            sig["axes_filter"] = axes_filter_tuple
+        if not files:
+            files = generate_astrasim_configs_from_hw(
+                hw_obj,
+                out_dir=astra_config_dir,
+                npus_count=npus_count,
+                axes_filter=axes_filter_tuple,
+                transform_2d_to_1d=transform_2d_to_1d,
+                ephemeral_outputs=ephemeral_configs,
+            )
+            if ephemeral_configs:
+                ephemeral_paths.extend(
+                    [
+                        files.get("system_json"),
+                        files.get("network_yaml"),
+                    ]
+                )
+        topo_list = files.get("topology_list")
+        npus_per_dim = files.get("npus_per_dim")
+        if topo_list:
+            sig["topology"] = list(topo_list)
+            sig["physical_topology"] = list(topo_list)
+        if npus_per_dim:
+            sig["npus_per_dim"] = list(npus_per_dim)
+
+        canonical = _canonical_sig(sig)
+
+        if workload_prefix:
+            pass
+        elif not manifest_json_path:
+            label = size_label(size_bytes)
+            base_dir = os.path.join(astra_config_dir, "workload", comm_lower, f"{npus_count}npus_{label}")
+            workload_prefix = os.path.join(base_dir, f"{comm_lower}_{label}")
+            expected = [f"{workload_prefix}.{r}.et" for r in range(npus_count)]
+            if not all(os.path.exists(p) for p in expected):
+                generate_workload_et(comm, npus_count, size_bytes, astra_config_dir=astra_config_dir)
+        else:
+            workload_prefix = os.path.splitext(manifest_json_path)[0]
+
+        remote_mem_path = get_remote_memory_path()
+
+        if manifest_json_path:
+            bundle_list: List[str] = [manifest_json_path]
+            for path in (files["system_json"], files["network_yaml"]):
+                if path and os.path.exists(path):
+                    bundle_list.append(path)
+            if remote_mem_path and os.path.exists(remote_mem_path):
+                bundle_list.append(remote_mem_path)
+            if comm_group_json and os.path.exists(comm_group_json):
+                bundle_list.append(comm_group_json)
+            cache_key = _hash_file_bundle(bundle_list)
+        else:
+            cache_key = _hash_sig(canonical)
+
+        if allow_read:
+            cache = _load_cache(cache_path)
+            entry = cache.get(cache_key) if cache else None
+            if entry:
+                cached_per = entry.get("per_node_sec", [])
+                cached_max = float(entry.get("max_sec", 0.0))
+                if cached_per and cached_max > 0 and len(cached_per) == int(npus_count) and all((t > 0 for t in cached_per)):
+                    if comm_lower == "graph":
+                        try:
+                            print(
+                                f"[AstraSim] Cache HIT: comm={comm}, npus={npus_count}, size={size_bytes}, total={cached_max:.6f}s"
+                            )
+                        except Exception:
+                            pass
+                    return cached_per, cached_max
+                if allow_write and cache_key in cache:
                     try:
-                        print(
-                            f"[AstraSim] Cache HIT: comm={comm}, npus={npus_count}, size={size_bytes}, total={cached_max:.6f}s"
-                        )
+                        cache.pop(cache_key)
+                        _save_cache(cache_path, cache)
                     except Exception:
                         pass
-                return cached_per, cached_max
-            if allow_write and cache_key in cache:
-                try:
-                    cache.pop(cache_key)
-                    _save_cache(cache_path, cache)
-                except Exception:
-                    pass
 
-    attempts = 0
-    per_node_sec: List[float] = []
-    max_sec: float = 0.0
-    last_outcome_zero = False
+        attempts = 0
+        per_node_sec: List[float] = []
+        max_sec: float = 0.0
+        last_outcome_zero = False
 
-    # Capture command details for debugging
-    bin_path = _astrasim_binary_path()
-    debug_cmd = [
-        bin_path,
-        f"--workload-configuration={workload_prefix}",
-        f"--system-configuration={files['system_json']}",
-        f"--network-configuration={files['network_yaml']}",
-    ]
-    if remote_mem_path:
-        debug_cmd.append(f"--remote-memory-configuration={remote_mem_path}")
-    if comm_group_json and os.path.exists(comm_group_json):
-        debug_cmd.append(f"--comm-group-configuration={comm_group_json}")
-
-    while attempts < 5:
-        attempts += 1
-        per_node_sec, max_sec = run_astrasim_analytical(
-            workload_prefix=workload_prefix,
-            system_json=files["system_json"],
-            network_yaml=files["network_yaml"],
-            remote_memory_json=remote_mem_path,
-            comm_group_json=comm_group_json,
-        )
-        if per_node_sec and max_sec > 0 and len(per_node_sec) == int(npus_count) and all((t > 0 for t in per_node_sec)):
-            last_outcome_zero = False
-            break
-        last_outcome_zero = True
-        time.sleep(0.5)
-    if last_outcome_zero:
+        # Capture command details for debugging
+        bin_path = _astrasim_binary_path()
+        debug_cmd = [
+            bin_path,
+            f"--workload-configuration={workload_prefix}",
+            f"--system-configuration={files['system_json']}",
+            f"--network-configuration={files['network_yaml']}",
+        ]
+        if remote_mem_path:
+            debug_cmd.append(f"--remote-memory-configuration={remote_mem_path}")
+        if comm_group_json and os.path.exists(comm_group_json):
+            debug_cmd.append(f"--comm-group-configuration={comm_group_json}")
         cmd_str = " ".join(debug_cmd)
-        raise RuntimeError(
-            f"AstraSim returned zero time for {comm} size={size_bytes} npus={npus_count} after 5 retries.\n"
-            f"Full AstraSim command:\n{cmd_str}"
-        )
+        # print(f"Full AstraSim command:\n{cmd_str}")
 
-    cache_entry = {
-        "signature": sig,
-        "canonical": canonical,
-        "per_node_sec": per_node_sec,
-        "max_sec": max_sec,
-        "workload_prefix": workload_prefix,
-        "system_json": files["system_json"],
-        "network_yaml": files["network_yaml"],
-    }
-    if manifest_json_path:
-        cache_entry["manifest_path"] = manifest_json_path
+        while attempts < 5:
+            attempts += 1
+            per_node_sec, max_sec = run_astrasim_analytical(
+                workload_prefix=workload_prefix,
+                system_json=files["system_json"],
+                network_yaml=files["network_yaml"],
+                remote_memory_json=remote_mem_path,
+                comm_group_json=comm_group_json,
+            )
+            if per_node_sec and max_sec > 0 and len(per_node_sec) == int(npus_count) and all((t > 0 for t in per_node_sec)):
+                last_outcome_zero = False
+                break
+            last_outcome_zero = True
+            time.sleep(0.1)
+        if last_outcome_zero:
+            raise RuntimeError(
+                f"AstraSim returned zero time for {comm} size={size_bytes} npus={npus_count} after 5 retries.\n"
+                f"Full AstraSim command:\n{cmd_str}"
+            )
 
-    if allow_write:
-        cache = _load_cache(cache_path)
-        cache[cache_key] = cache_entry
-        _save_cache(cache_path, cache)
+        cache_entry = {
+            "signature": sig,
+            "canonical": canonical,
+            "per_node_sec": per_node_sec,
+            "max_sec": max_sec,
+            "workload_prefix": workload_prefix,
+            "system_json": files["system_json"],
+            "network_yaml": files["network_yaml"],
+        }
+        if manifest_json_path:
+            cache_entry["manifest_path"] = manifest_json_path
 
-    return per_node_sec, max_sec
+        if allow_write:
+            cache = _load_cache(cache_path)
+            cache[cache_key] = cache_entry
+            _save_cache(cache_path, cache)
+
+        return per_node_sec, max_sec
+    finally:
+        if ephemeral_paths:
+            for cleanup_path in {p for p in ephemeral_paths if p}:
+                if _path_within_dir(cleanup_path, astra_config_dir):
+                    try:
+                        os.remove(cleanup_path)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        pass
+        if temp_cache_dir is not None:
+            shutil.rmtree(temp_cache_dir, ignore_errors=True)
 
 
 __all__ = [

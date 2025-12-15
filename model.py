@@ -20,7 +20,8 @@ class Model_GEMM:
       
 class Model_LLM:
   def __init__(self, exp_config):
-      self.batch_size       = exp_config.model_config.batch_size
+      self.global_batch_size = exp_config.model_config.global_batch_size
+      self.gradient_accumulation_steps = exp_config.model_config.gradient_accumulation_steps
       self.vocab_size       = exp_config.model_config.vocab_size
       self.num_layers      = exp_config.model_config.num_layers
       self.hidden_dim       = exp_config.model_config.hidden_dim
@@ -41,7 +42,7 @@ class Model_LLM:
 
       self.moe_num_experts = int(getattr(exp_config.model_config, "num_experts", 1))
       self.moe_top_k = int(getattr(exp_config.model_config, "top_k", 1))
-      if self.moe_top_k > self.moe_num_experts:
+      if self.moe_top_k > self.moe_num_experts and self.moe_num_experts > 1:
           raise ValueError("model_param.top_k cannot exceed model_param.num_experts")
       self.use_moe = self.moe_num_experts > 1
       

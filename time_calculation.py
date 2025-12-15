@@ -8,13 +8,12 @@ from typing import Optional
 # import numpy as np
 
 from parallelism import Parallelism
-from topology import Topology
 from simulate import Graph
 import util
 from hw_component import Core, MemoryHierarchy, Network, DRAM
 from astrasim_lib import run_cache_astrasim
 from model import Model_LSTM, Model_GEMM, Model_LLM
-from tile import TiledGEMM, formatBytes
+from tile import AccessBytes, TiledGEMM, formatBytes
 
 algByte = False  # algorithmic ops false
 proj = False  # consider projection layer, turn off for end-2-end validation, as baeline model does not have projection layer
@@ -28,18 +27,23 @@ class NetworkModel:
         self._roofline = roofline_cb
         self._astra_policy = astra_policy or "analytical"
 
-    def _astra_collective(self, kind: str, participants: int, size_bytes: int) -> float:
+    def _astra_collective(self, kind: str, participants: int, size_bytes: int, axis: Optional[str] = None) -> float:
         part = int(participants)
         if part <= 1 or size_bytes <= 0:
             return 0.0
         byte_count = int(math.ceil(size_bytes))
+        axes_filter = [str(axis).lower()] if axis else None
+        if os.environ.get("DEEPFLOW_ASTRA_SKIP_EXEC"):
+            return 0.0
+        # for collectives ONLY, we cannot use 2D topologies (Mesh2D, Torus2D, KingMesh2D)
+        # transform them to their 1D equivalents (Ring, Mesh, HyperCube (?))
         _, max_sec = run_cache_astrasim(
             self.hw_config,
             comm=kind,
             npus_count=part,
             size_bytes=byte_count,
-            astra_config_dir="./astra_cache",
-            cache_path="./astra_cache/cache.json",
+            axes_filter=axes_filter,
+            transform_2d_to_1d=True,
         )
         return float(max_sec)
 
@@ -55,6 +59,7 @@ class NetworkModel:
         local_bytes: float = 0.0,
         local_ops: float = 0.0,
         debug_label: str = "",
+        axis: Optional[str] = None,
     ) -> float:
         if size_bytes <= 0:
             return 0.0
@@ -77,7 +82,8 @@ class NetworkModel:
             if kind in collective_ops or kind == "pipeline":
                 # Pipeline uses 2 NPUs for point-to-point, others use part
                 npus = 2 if kind == "pipeline" else part
-                network_time = self._astra_collective(kind, npus, network_bytes)
+                axis_filter = axis if kind != "pipeline" else None
+                network_time = self._astra_collective(kind, npus, network_bytes, axis_filter)
             else:
                 raise ValueError(f"Unsupported collective operation: {kind}")
         else:
@@ -136,8 +142,10 @@ class NetworkModel:
         data_transfer = ((per_rank / ib) + mem_access + ll) * 2 * (participants - 1)
         prep_comp = per_rank
         prep_mem = int(math.ceil(3 * size_bytes / participants))
+
+        # NOTE: removed overhead because it made it impossible to eliminate network effects even with inf bandwidth and zero latency
         data_prep = (
-            self._roofline(prep_comp, prep_mem, name=f"{label}-prep") + self.O
+            self._roofline(prep_comp, prep_mem, name=f"{label}-prep") # + self.O
         ) * (participants - 1)
         return data_transfer + data_prep
 
@@ -195,6 +203,8 @@ class TimeCalculation:
         # If we want proper backported LSTM support we need to fix this at *some* point.
         self.h2d_bandwidth = getattr(hw_config.sw_config, "h2d_bandwidth", -1)
         self.zero_stage = getattr(hw_config.sw_config, "dp_zero_stage", 0)
+        self.full_recomputation = getattr(hw_config.sw_config, "full_recomputation", False)
+        self.dp_microbatch = getattr(hw_config.sw_config, "dp_microbatch", "every_mb")
         self.attached = True
 
         # Hardware Parameters
@@ -208,83 +218,20 @@ class TimeCalculation:
         self.num_levels = self.memoryHierarchy.num_levels
         self.memLayer = self.memoryHierarchy.memLayer
         self.tileSpace = None
-
-        # TODO: move this to config file
         self.H2Dbw = self.h2d_bandwidth
-
-
-        # System Parameters
-        self.num_wafer = hw_config.system_config.num_wafers
-        self.num_workers = hw_config.system_config.num_workers
-
-
+        self.num_workers = self._derive_num_workers(hw_config)
 
         level = 0
         mem_config = hw_config.memory_hierarchy.mem_hr[level]
         self.DRAM = DRAM(hw_config, mem_config, level)
-        self.memory_capacity = self.DRAM.size * self.num_workers# in bytes
-
-        # self.memory_capacity = hw_config.perimeter_breakdown.DRAM
-
         self.network = Network(hw_config)
 
-        intra_throughput, inter_throughput = self.network.calcThroughput()
-        intra_latency, inter_latency = self.network.calcLatency()
-
-        inter_derate = hw_config.system_config.inter_derate
-        intra_derate = hw_config.system_config.intra_derate
-        par2cross = hw_config.system_config.par2cross
-
-        derated_inter_throughput = -1
-        derated_intra_throughput = -1
-
-        # inter-wafer communications will pass through intra links too
-        if self.num_wafer > 1 and self.num_workers > 1:
-            if intra_derate != 0:
-                derated_inter_throughput = min(
-                    intra_throughput / intra_derate, inter_throughput / inter_derate
-                )
-                # print(f'intra_throughput / intra_derate: {intra_throughput / intra_derate}, inter_throughput / inter_derate: {inter_throughput / inter_derate}')
-            else:
-                derated_inter_throughput = inter_throughput / inter_derate
-                # print(f'inter_throughput / inter_derate: {inter_throughput / inter_derate}')
-        else:
-            derated_inter_throughput = 0
-
-        if self.num_workers > 1 and intra_derate != 0:
-            derated_intra_throughput = intra_throughput / intra_derate
-        else:
-            derated_intra_throughput = 0
-
-        self.IBK1, self.LLK1 = (
-            (derated_inter_throughput, inter_latency)
-            if par2cross["kp1"]
-            else (derated_intra_throughput, intra_latency)
-        )
-        self.IBK2, self.LLK2 = (
-            (derated_inter_throughput, inter_latency)
-            if par2cross["kp2"]
-            else (derated_intra_throughput, intra_latency)
-        )
-        self.IBD, self.LLD = ( #interconnect bandwidth and latency for data parallelism
-            (derated_inter_throughput, inter_latency)
-            if par2cross["dp"]
-            else (derated_intra_throughput, intra_latency)
-        )
-        self.IBL, self.LLL = (
-            (derated_inter_throughput, inter_latency)
-            if par2cross["lp"]
-            else (derated_intra_throughput, intra_latency)
-        )
-
-        self.IBTP, self.LLTP = (
-            (derated_inter_throughput, inter_latency)
-            if par2cross["tp"]
-            else (derated_intra_throughput, intra_latency)
-        )
+        self.IBK1, self.LLK1 = self.network.get_link("kp1")
+        self.IBK2, self.LLK2 = self.network.get_link("kp2")
+        self.IBD, self.LLD = self.network.get_link("dp")
+        self.IBL, self.LLL = self.network.get_link("lp")
+        self.IBTP, self.LLTP = self.network.get_link("tp")
         
-
-
         # Scheduling Parameters
         par = Parallelism(hw_config)
         par.findParallelStrategy()
@@ -312,17 +259,17 @@ class TimeCalculation:
         try:
             self.tp = int(tp_value)
         except (TypeError, ValueError) as exc:
-            raise ValueError("scheduling_param.tp must be an integer") from exc
+            raise ValueError("parallelism.tp must be an integer") from exc
         if self.tp < 1:
-            raise ValueError("scheduling_param.tp must be >= 1")
+            raise ValueError("parallelism.tp must be >= 1")
 
         cp_value = par.cp if par.cp not in (None, 0) else 1
         try:
             self.cp = int(cp_value)
         except (TypeError, ValueError) as exc:
-            raise ValueError("scheduling_param.cp must be an integer") from exc
+            raise ValueError("parallelism.cp must be an integer") from exc
         if self.cp < 1:
-            raise ValueError("scheduling_param.cp must be >= 1")
+            raise ValueError("parallelism.cp must be >= 1")
 
         self.tp_sp = par.tp_sp
 
@@ -333,30 +280,18 @@ class TimeCalculation:
         else:
             self.kp1 = None
             self.kp2 = None
-        run_type = model_config.model_config.run_type
-        if run_type == "inference":
-            if self.cp > 1:
-                raise ValueError(
-                    "Context parallelism (cp) is not supported for LLM inference. "
-                    "Please set scheduling_param.cp to 1 for inference runs."
-                )
-            if self.mb > 1:
-                print(f"[WARNING]: LLM inference configured with mb={self.mb} (>1). \n Pipeline micro-batching is ill-defined for autoregressive decode and should be avoided.")
 
-        if self.mode == "LLM":
-            expected_workers = self.tp * self.cp * self.dp * self.lp
-            label = f"tp({self.tp}) * cp({self.cp}) * dp({self.dp}) * lp({self.lp})"
-        else:
-            kp1 = int(self.kp1) if self.kp1 else 1
-            kp2 = int(self.kp2) if self.kp2 else 1
-            expected_workers = self.dp * self.lp * kp1 * kp2
-            label = f"dp({self.dp}) * lp({self.lp}) * kp1({kp1}) * kp2({kp2})"
+        if self.mode != "GEMM":
+            run_type = model_config.model_config.run_type
+            if run_type == "inference":
+                if self.cp > 1:
+                    raise ValueError(
+                        "Context parallelism (cp) is not supported for LLM inference. "
+                        "Please set parallelism.cp to 1 for inference runs."
+                    )
+                if self.mb > 1:
+                    print(f"[WARNING]: LLM inference configured with mb={self.mb} (>1). \n Pipeline micro-batching is ill-defined for autoregressive decode and should be avoided.")
 
-        if expected_workers != self.num_workers:
-            raise ValueError(
-                f"Parallelism mismatch: {label} = {expected_workers}, "
-                f"but system_hierarchy reports num_workers={self.num_workers}."
-            )
         
         # Statistics Param
         self.tot_flop = 0
@@ -377,11 +312,10 @@ class TimeCalculation:
             self.roofline,
             astra_policy=self._astra_policy,
         )
-        
+
         # Dynamically select and instantiate the model class
         model_class = self.get_model_class(mode)
         self.model = model_class(model_config)  # Instantiate the model class
-
 
         # Model Parameters
         # self.model = self.get_model_class(mode)
@@ -406,7 +340,14 @@ class TimeCalculation:
             self.N = self.model.N
             
         if mode == "LLM":
-            self.batch_size = self.model.batch_size
+            self.global_batch_size = self.model.global_batch_size
+            self.gradient_accumulation_steps = self.model.gradient_accumulation_steps
+
+            if self.global_batch_size % self.gradient_accumulation_steps != 0:
+                raise ValueError(
+                    "Global batch size must be divisible by gradient accumulation steps"
+                )
+            self.batch_size = self.global_batch_size // self.gradient_accumulation_steps
             self.vocab_size = self.model.vocab_size
             self.num_layers = self.model.num_layers
             self.hidden_dim = self.model.hidden_dim
@@ -429,9 +370,38 @@ class TimeCalculation:
             raw_top_k = getattr(self.model, "moe_top_k", 1)
             self.moe_num_experts = max(1, int(raw_num_experts))
             self.moe_top_k = max(1, int(raw_top_k))
-            if self.moe_top_k > self.moe_num_experts:
-                raise ValueError("model_param.top_k cannot exceed model_param.num_experts")
             self.use_moe = self.moe_num_experts > 1
+
+
+    def _derive_num_workers(self, hw_config) -> int:
+        layout = getattr(hw_config, "network_layout", None)
+        if layout and getattr(layout, "dimensions", None):
+            total = 1
+            for dim in layout.dimensions:
+                try:
+                    size = int(dim.size)
+                except (TypeError, ValueError):
+                    size = 1
+                if size < 1:
+                    size = 1
+                total *= size
+            if total >= 1:
+                return int(total)
+
+        factors = []
+        for name in ("dp", "lp", "tp", "cp", "kp1", "kp2"):
+            value = getattr(hw_config.sch_config, name, 1)
+            try:
+                factor = int(value) if value else 1
+            except (TypeError, ValueError):
+                factor = 1
+            if factor < 1:
+                factor = 1
+            factors.append(factor)
+        total = 1
+        for factor in factors:
+            total *= factor
+        return max(1, total)
    
 
     def get_model_class(self, model_type):
@@ -770,7 +740,7 @@ class TimeCalculation:
                 self.memLayer[i].printStats(f)
 
             self.network.printStats(f)
-    def roofline(self, flop, mem_access_, name="", info=False, mem_level=None, flashattn_enable=False):
+    def roofline(self, flop, mem_access_, name="", util=1, info=False, mem_level=None, flashattn_enable=False):
         # print("Roofline: entered {}".format(name))
 
         # Parse mem_access_ into consistent format
@@ -785,6 +755,8 @@ class TimeCalculation:
             print("mem_access_ should be integer or list, wrong input", flush=True)
             sys.exit(0)
 
+        throughput = self.th * util
+
         # Determine which levels to compute
         if mem_level is not None:
             # Single level mode
@@ -794,7 +766,7 @@ class TimeCalculation:
             num_level = len(mem_access)
             try:
                 if not flashattn_enable:
-                    assert mem_access[num_level - 1] > 0, "last_level_mem = 0"
+                    assert mem_access[num_level - 1] > 0, f"mem_access: {mem_access_}"
             except Exception as e:
                 print(
                     "{}: Number of accesses to the last level of memory hierarchy cannot be zero:\n {}".format(
@@ -810,13 +782,13 @@ class TimeCalculation:
         for level_idx, num_mem in levels_to_compute:
             mem_bw = self.memLayer[level_idx].getThroughput()
             mem_latency = self.memLayer[level_idx].getLatency()
-            inflection_point = float("inf") if mem_bw == 0 else self.th / mem_bw
+            inflection_point = float("inf") if mem_bw == 0 else throughput / mem_bw
             # print(f"Level {level_idx}: mem_bw={mem_bw}, mem_latency={mem_latency}, inflection_point={inflection_point}", flush=True)
             comp_int = float("inf") if num_mem == 0 else flop / num_mem
             if comp_int < inflection_point:  # mem-bound
                 level_time = (float("inf") if (mem_bw == 0 or num_mem == 0) else (num_mem / mem_bw)) + mem_latency
             else:  # compute-bound
-                level_time = float("inf") if (self.th == 0) else (flop / self.th)
+                level_time = float("inf") if (throughput == 0) else (flop / throughput)
 
             times.append(level_time)
 
@@ -824,12 +796,14 @@ class TimeCalculation:
 
         # print("Roofline: exited {}".format(name))
         return max_time
-    def getGEMMTime(self, dim1, dim2, dim3, name, 
+    
+    def getGEMMTime(self, dim1, dim2, dim3, name="", 
                     flashattn_enable=False, disable_overhead=False, read_bytes_l2=0, write_bytes_l2=0, original=False):
         # Streaming best selection to avoid building large dicts
         best_time = float("inf")
         best_choice = None  # type: Optional[tuple]
         best_mem_access = None  # type: Optional[tuple]
+        best_rw_access = None  # type: Optional[AccessBytes]
         best_gemm = None  # type: Optional[TiledGEMM]
         best_metric = float("inf")
 
@@ -841,8 +815,9 @@ class TimeCalculation:
                 print("===============================================================")
 
             GEMM_flop = gemm.GEMM_flop
-            mem_access = gemm.mem_accesses
+            rw_accesses = gemm.mem_accesses
 
+            mem_access = rw_accesses.totals() # (L0, L1, L2, DRAM)
             if flashattn_enable:
                 mem_access = list(mem_access)
                 mem_access[3] = 0 # no HBM accesses
@@ -859,7 +834,17 @@ class TimeCalculation:
             if eff_sm > 0:
                 mem_access_per_sm[1] = mem_access_per_sm[1] / eff_sm
 
-            GEMM_time = self.roofline(GEMM_flop, mem_access_per_sm, name, flashattn_enable=flashattn_enable) 
+            if flashattn_enable:
+                sm_util = 0.25 # assume 25% SM utilization for FlashAttention (Dao, 2023)
+            else:
+                sm_util = 1
+                gemm_waves = self.memLayer[1].calc_waves_per_sm(dim1, dim2, dim3, gemm.l2_M, gemm.l2_K, gemm.l2_N)
+                if gemm_waves != -1:
+                    full_waves = math.floor(gemm_waves)
+                    partial_wave = gemm_waves - full_waves
+                    sm_util = (full_waves + partial_wave * partial_wave) / gemm_waves
+
+            GEMM_time = self.roofline(GEMM_flop, mem_access_per_sm, name, util=sm_util, flashattn_enable=flashattn_enable) 
             if flashattn_enable or disable_overhead:
                 pass
             else:
@@ -873,12 +858,14 @@ class TimeCalculation:
             key = (gemm._inner_code, tile_dims)
 
             # Tie-breaker metric identical to previous selection: hypot(dram, l2)
+            
             metric = math.hypot(mem_access[3], mem_access[2])
 
             if (GEMM_time < best_time) or (GEMM_time == best_time and metric < best_metric):
                 best_time = GEMM_time
                 best_choice = key
                 best_mem_access = mem_access
+                best_rw_access = rw_accesses
                 best_gemm = gemm
                 best_metric = metric
 
@@ -897,7 +884,7 @@ class TimeCalculation:
         # 2 -> inner 'n' (activation stationary)
         best_inner_code = best_choice[0]  # type: ignore[index]
         best_tile_dims = best_choice[1]  # type: ignore[index]
-        return best_time, best_inner_code, best_tile_dims, mem_access
+        return best_time, best_inner_code, best_tile_dims, mem_access #, best_rw_access
     
     def generateTileSpace(self, dim1=None, dim2=None, dim3=None, original=False):
         tile_space = []
@@ -1488,86 +1475,38 @@ class TimeCalculation:
 
     # Reduction and all-gather time estimation
 
-    def gradClipping(self, Dim0=None, Dim1=None, name=None):
-        if Dim0 == None:
-            Dim0 = 2 * self.D
-        if Dim1 == None:
-            Dim1 = self.G * self.D
-        if name == None:
-            name = "Hidden"
-        # t_list[i] * clip_norm / max(global_norm, clip_norm)
-        # where:
-        # global_norm = sqrt(sum([l2norm(t)**2 for t in t_list]))
+    def grad_clipping(self, num_params: int) -> float:
+        """Gradient clipping (L2 norm + scale) cost."""
+        norm_comp = num_params * 2  # square + sum
+        clip_comp = num_params * 2  # scale + divide
+        clip_mem = num_params * 2 * self.precision.gradients  # read + write
 
-        norm_comp = Dim0 * Dim1 * 2
-        # 1: power 2
-        # 1: summ
-        norm_mem = (Dim0 * Dim1 * 1) * self.precision_bytes
-        # 1: one read per element and power it by 2 in local registers  anfd
-        # summing to local acc
-
-        clip_comp = Dim0 * Dim1 * 2
-        # 1: pointwise mul
-        # 1: pointwise div
-
-        clip_mem = (Dim0 * Dim1 * 2) * self.precision_bytes
-        # 1: one read for pointwise mul
-        # 1: one write for pointwise div
-
-        gradclip_mem = norm_mem + clip_mem
+        gradclip_mem = clip_mem
         gradclip_comp = norm_comp + clip_comp
 
-        gradclip_time = self.roofline(
-            gradclip_comp, gradclip_mem, name="pointwise-grad-clipping"
+        return self.roofline(gradclip_comp, gradclip_mem, name="pointwise-grad-clipping")
+
+    def apply_grad(self, num_params: int) -> float:
+        """Approximate optimizer update cost (Adam/AdamW-style) per parameter tensor."""
+        OPT_FLOPS_PER_PARAM = 14.0 # typical for Adam
+        bytes_per_param_read = (
+            self.precision.parameters
+            + self.precision.gradients
+            + 2 * self.precision.optimizer_states
+            + self.precision.master_parameters
+        )
+        bytes_per_param_write = (
+            self.precision.parameters
+            + 2 * self.precision.optimizer_states
+            + self.precision.master_parameters
         )
 
-        if self.debug:
-            print(
-                "({}) gradclip_flop: {:,}, gradclip_mem: {:,}".format(
-                    name, gradclip_comp, gradclip_mem
-                )
-            )
-            print("({}) gradclip_time: {:,}\n".format(name, gradclip_time))
+        apply_grad_comp = num_params * OPT_FLOPS_PER_PARAM
+        apply_grad_mem = num_params * (bytes_per_param_read + bytes_per_param_write)
 
-        return gradclip_time
-
-    def apply_grad(self, Dim0=None, Dim1=None, name=None):
-        if Dim0 == None:
-            Dim0 = 2 * self.D
-        if Dim1 == None:
-            Dim1 = self.G * self.D
-        if name == None:
-            name = "Hidden"
-
-        applyGrad_comp = Dim0 * Dim1 * 3
-        # 3: one pointwise division by  scalar after reducing all the gradients,
-        #   one final addition of gradients to the weights
-        #   one multiply by learning rate
-        applyGrad_mem = (
-            (1 * Dim0 * Dim1 * self.precision_bytes)
-            + (2 * Dim0 * Dim1 * self.precision_bytes)
-            + (1 * Dim0 * Dim1 * self.precision_bytes)
-        )
-        # 1: read for pointiwse div
-        # 2: 1 reads and one write for pointwise add
-        # 1: one write for multiplication by lr
-        applyGrad_time = self.roofline(
-            applyGrad_comp, applyGrad_mem, name="pointwise-applyGrad"
-        )
-
-        clip_time = self.gradClipping(Dim0, Dim1, name)
-
-        grad_time = applyGrad_time + clip_time
-
-        if self.debug:
-            print(
-                "({}) applyGrad_flop: {:,}, applyGrad_mem: {:,}".format(
-                    name, applyGrad_comp, applyGrad_mem
-                )
-            )
-            print("({}) applyGrad_time: {:,}\n".format(name, applyGrad_time))
-
-        return grad_time
+        apply_grad_time = self.roofline(apply_grad_comp, apply_grad_mem, name="apply_grad", mem_level=self.num_levels-1)
+        clip_time = self.grad_clipping(num_params)
+        return apply_grad_time + clip_time
 
 
 
@@ -1749,7 +1688,7 @@ class TimeCalculation:
                 local_bytes=0.0,
                 debug_label=name or "comm",
             )
-            apply_grad_time = self.apply_grad(Dim0=k / dim1, Dim1=n, name=name)
+            apply_grad_time = self.apply_grad(int(math.ceil((k / dim1) * n)))
 
         elif self.kp_hidden_type == 2:  # RC
             total_bytes = math.ceil(self.precision_bytes * (k / dim1) * (n / dim2))
@@ -1775,7 +1714,7 @@ class TimeCalculation:
                 local_bytes=3 * total_bytes,
                 debug_label=name or "comm",
             )
-            apply_grad_time = self.apply_grad(Dim0=k, Dim1=n / dim2, name=name)
+            apply_grad_time = self.apply_grad(int(math.ceil(k * (n / dim2))))
         else:
             reduction_time_wt_kp = 0
             total_bytes = math.ceil(self.precision_bytes * k * n)
@@ -1788,7 +1727,7 @@ class TimeCalculation:
                 local_bytes=0.0,
                 debug_label=name or "comm",
             )
-            apply_grad_time = self.apply_grad(Dim0=k, Dim1=n, name=name)
+            apply_grad_time = self.apply_grad(int(math.ceil(k * n)))
         if self.debug:
             print(f"reduction_time_wt_kp: {reduction_time_wt_kp}")
             print(f"reduction_time_wt_dp: {reduction_time_wt_dp}")

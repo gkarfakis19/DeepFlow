@@ -4,11 +4,284 @@ import math
 import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, Tuple, Optional, List, Set
+from typing import Any, Dict, Tuple, Optional, List, Set, Sequence, Mapping
+from collections import defaultdict
+from collections import defaultdict
 
 import simulate_LLM
 from astrasim_lib import run_astra_simulation_only_onepath
+from astrasim_lib.fault_projection import FaultProjectionResult, FaultSpace
+from astrasim_lib.layout_utils import axis_layout_from_descriptor
 from simulate_LLM import Graph
+from util import log_message
+from typing import Iterable
+
+
+def _mode_label(mode: Any) -> str:
+    for attr in ("value", "name"):
+        if hasattr(mode, attr):
+            return str(getattr(mode, attr)).lower()
+    return str(mode).lower()
+
+
+def _copy_node_metadata(source: simulate_LLM.Node, target: simulate_LLM.Node) -> None:
+    for attr in (
+        "micro_batch_index",
+        "layer_index",
+        "direction",
+        "stage_id",
+        "tp_rank",
+        "cp_rank",
+    ):
+        if hasattr(source, attr):
+            setattr(target, attr, getattr(source, attr))
+
+
+def _copy_edge_metadata(source: simulate_LLM.Edge, target: simulate_LLM.Edge) -> None:
+    for attr in (
+        "local_hw_id",
+        "stage_id",
+        "micro_batch_index",
+        "layer_index",
+        "direction",
+        "tp_rank",
+        "cp_rank",
+    ):
+        if hasattr(source, attr):
+            setattr(target, attr, getattr(source, attr))
+
+
+def _detach_edge(parent: Any, child: Any) -> None:
+    children = getattr(parent, "children", None)
+    if isinstance(children, list):
+        try:
+            children.remove(child)
+        except ValueError:
+            pass
+    parents = getattr(child, "parents", None)
+    if isinstance(parents, list):
+        try:
+            parents.remove(parent)
+        except ValueError:
+            pass
+
+
+def _connect_edge(parent: Any, child: Any) -> None:
+    if child in getattr(parent, "children", []):
+        return
+    parent.add_child(child)
+
+
+def _split_tp_node(
+    node: simulate_LLM.Node,
+    tp_children: List[simulate_LLM.Edge],
+    overlap: float,
+) -> None:
+    if overlap <= 0.0 or not tp_children:
+        return
+
+    duration = float(getattr(node, "duration", 0.0) or 0.0)
+    if duration <= 0.0:
+        return
+
+    if overlap >= 1.0:
+        parents = list(getattr(node, "parents", []))
+        tp_succs: List[Any] = []
+        for tp_edge in tp_children:
+            _detach_edge(node, tp_edge)
+            for parent in parents:
+                _connect_edge(parent, tp_edge)
+            for succ in list(getattr(tp_edge, "children", []) or []):
+                tp_succs.append(succ)
+        for succ in tp_succs:
+            _connect_edge(node, succ)
+        return
+
+    head_duration = duration * (1.0 - overlap)
+    tail_duration = duration * overlap
+    if head_duration <= 0.0 or tail_duration <= 0.0:
+        return
+
+    tail = node
+    tail.duration = tail_duration
+    head = simulate_LLM.Node(
+        name=f"{tail.name}_head",
+        op_id=getattr(tail, "op_id", 0),
+        hw_id=tail.hw_id,
+        duration=head_duration,
+        fwd=tail.fwd,
+    )
+    _copy_node_metadata(tail, head)
+
+    parents = list(getattr(tail, "parents", []))
+    for parent in parents:
+        _detach_edge(parent, tail)
+        _connect_edge(parent, head)
+
+    _connect_edge(head, tail)
+
+    for tp_edge in tp_children:
+        _detach_edge(tail, tp_edge)
+        _connect_edge(head, tp_edge)
+        for succ in list(getattr(tp_edge, "children", []) or []):
+            _connect_edge(tail, succ)
+
+
+def _apply_tp_overlap_transforms(root: Any, parallelism_mode: Any, tp_overlap: float, tp_sp_overlap: float) -> Any:
+    mode = _mode_label(parallelism_mode)
+    if mode == "tensor_sequence":
+        overlap = tp_sp_overlap
+    elif mode in {"tensor", "tensor_context_hybrid"}:
+        overlap = tp_overlap
+    else:
+        return root
+    if overlap <= 0.0:
+        return root
+
+    nodes_to_process: List[simulate_LLM.Node] = []
+    visited: Set[int] = set()
+    stack: List[Any] = list(root) if isinstance(root, (list, tuple)) else [root]
+    while stack:
+        obj = stack.pop()
+        obj_id = id(obj)
+        if obj_id in visited:
+            continue
+        visited.add(obj_id)
+        if isinstance(obj, simulate_LLM.Node):
+            nodes_to_process.append(obj)
+        for child in getattr(obj, "children", []):
+            stack.append(child)
+
+    for node in nodes_to_process:
+        tp_children = [
+            child for child in getattr(node, "children", [])
+            if isinstance(child, simulate_LLM.Edge) and getattr(child, "comm_interconnect_type", None) == "tp"
+        ]
+        if not tp_children:
+            continue
+        _split_tp_node(node, tp_children, overlap)
+    return root
+
+
+def _apply_cp_overlap_transforms(root: Any, parallelism_mode: Any, cp_overlap: float) -> Any:
+    mode = _mode_label(parallelism_mode)
+    if mode not in {"context", "tensor_context_hybrid"}:
+        return root
+    overlap = cp_overlap
+    if overlap <= 0.0:
+        return root
+
+    cp_edges: List[simulate_LLM.Edge] = []
+    visited: Set[int] = set()
+    stack: List[Any] = list(root) if isinstance(root, (list, tuple)) else [root]
+    while stack:
+        obj = stack.pop()
+        obj_id = id(obj)
+        if obj_id in visited:
+            continue
+        visited.add(obj_id)
+        if isinstance(obj, simulate_LLM.Edge) and getattr(obj, "comm_interconnect_type", None) == "cp":
+            cp_edges.append(obj)
+        for child in getattr(obj, "children", []):
+            stack.append(child)
+
+    for edge in cp_edges:
+        _split_cp_edge(edge, overlap)
+    return root
+
+
+def _split_cp_edge(edge: simulate_LLM.Edge, overlap: float) -> None:
+    attention_children = [
+        child for child in getattr(edge, "children", [])
+        if isinstance(child, simulate_LLM.Node) and "attention" in str(getattr(child, "name", "")).lower()
+    ]
+    if not attention_children:
+        return
+
+    total_bytes = int(getattr(edge, "comm_size_bytes", 0) or 0)
+    preds = list(getattr(edge, "parents", []))
+    succs = list(getattr(edge, "children", []))
+
+    if overlap >= 1.0 or total_bytes <= 0:
+        for attention in attention_children:
+            _detach_edge(edge, attention)
+            for pred in preds:
+                _connect_edge(pred, attention)
+        for succ in succs:
+            if succ in attention_children:
+                continue
+            for attention in attention_children:
+                _connect_edge(attention, succ)
+            _connect_edge(edge, succ)
+        return
+
+    block_bytes = int(math.ceil(total_bytes * (1.0 - overlap)))
+    ovlp_bytes = max(0, total_bytes - block_bytes)
+    if block_bytes <= 0:
+        _split_cp_edge(edge, 1.0)
+        return
+
+    block_edge = simulate_LLM.Edge(
+        name=f"{edge.name}_block",
+        op_id=getattr(edge, "op_id", 0),
+        duration=0,
+        is_dp=edge.is_dp,
+        comm_size_bytes=block_bytes,
+        comm_type=edge.comm_type,
+        participants=edge.participants,
+        comm_interconnect_type=edge.comm_interconnect_type,
+    )
+    ovlp_edge = None
+    if ovlp_bytes > 0:
+        ovlp_edge = simulate_LLM.Edge(
+            name=f"{edge.name}_ovlp",
+            op_id=getattr(edge, "op_id", 0),
+            duration=0,
+            is_dp=edge.is_dp,
+            comm_size_bytes=ovlp_bytes,
+            comm_type=edge.comm_type,
+            participants=edge.participants,
+            comm_interconnect_type=edge.comm_interconnect_type,
+        )
+        _copy_edge_metadata(edge, ovlp_edge)
+    _copy_edge_metadata(edge, block_edge)
+
+    for pred in preds:
+        _detach_edge(pred, edge)
+        _connect_edge(pred, block_edge)
+
+    for attention in attention_children:
+        _detach_edge(edge, attention)
+        _connect_edge(block_edge, attention)
+
+    if ovlp_edge is not None:
+        _connect_edge(block_edge, ovlp_edge)
+
+    for succ in succs:
+        if succ in attention_children:
+            continue
+        _detach_edge(edge, succ)
+        for attention in attention_children:
+            _connect_edge(attention, succ)
+        if ovlp_edge is not None:
+            _connect_edge(ovlp_edge, succ)
+        else:
+            _connect_edge(block_edge, succ)
+
+
+def apply_overlap_transforms(
+    root: Any,
+    parallelism_mode: Any,
+    tp_overlap: float,
+    tp_sp_overlap: float,
+    cp_overlap: float,
+) -> Any:
+    """Apply TP/TP_SP/CP overlap rewrites to a constructed graph."""
+    if root is None:
+        return None
+    root = _apply_tp_overlap_transforms(root, parallelism_mode, tp_overlap, tp_sp_overlap)
+    root = _apply_cp_overlap_transforms(root, parallelism_mode, cp_overlap)
+    return root
 
 
 def _env_flag(name: str) -> bool:
@@ -48,6 +321,8 @@ class PipelineGraphFlattener:
         self,
         pipeline_graph: Graph,
         transformer_graph: Graph,
+        *,
+        rank_layout: Optional[Dict[str, Any]] = None,
     ) -> None:
         if transformer_graph is None:
             raise ValueError("Transformer graph is required for flattening")
@@ -63,11 +338,50 @@ class PipelineGraphFlattener:
         par_degree = transformer_graph.tp * transformer_graph.cp
         self._par_degree = max(1, int(par_degree))
         self._zero_stage = int(getattr(transformer_graph, "misc_metadata", {}).get("dp_zero_stage", 0))
+        self._layout_axis_order: Optional[List[str]] = None
+        self._layout_axis_sizes: Dict[str, int] = {}
+        self._layout_axis_strides: Dict[str, int] = {}
+        self._tp_size = int(getattr(transformer_graph, "tp", 1))
+        self._cp_size = int(getattr(transformer_graph, "cp", 1))
+        self._lp_size = int(getattr(pipeline_graph, "lp", 1))
+        if rank_layout is not None:
+            self._configure_rank_layout(rank_layout)
 
         # Track original ZeRO-3 transformer gather edges -> per-rank clones
         self._clone_cache: Dict[int, Any] = {}
         self._op_id_counter: int = 0
-        
+        self._stage_span = 1
+
+    def _configure_rank_layout(self, descriptor: Dict[str, Any]) -> None:
+        axis_order = list(descriptor.get("axis_order", []))
+        axis_sizes = dict(descriptor.get("axis_sizes", {}))
+        axis_strides = dict(descriptor.get("axis_strides", {}))
+        if not axis_order:
+            self._layout_axis_order = None
+            return
+        self._layout_axis_order = axis_order
+        self._layout_axis_sizes = axis_sizes
+        if not axis_strides:
+            span = 1
+            for axis in axis_order:
+                axis_strides[axis] = span
+                span *= axis_sizes.get(axis, 1)
+        self._layout_axis_strides = axis_strides
+        self._tp_size = max(1, axis_sizes.get("tp", self._tp_size))
+        self._cp_size = max(1, axis_sizes.get("cp", self._cp_size))
+        self._lp_size = max(1, axis_sizes.get("lp", self._lp_size))
+        if self._par_degree != self._tp_size * self._cp_size:
+            raise ValueError(
+                f"Inconsistent tensor/context parallel factors: tp={self._tp_size}, cp={self._cp_size}, "
+                f"product does not equal par_degree={self._par_degree}"
+            )
+        stage_span = 1
+        for axis in axis_order:
+            if axis == "dp":
+                continue
+            stage_span *= axis_sizes.get(axis, 1)
+        self._stage_span = stage_span
+
     def _should_shard_zero3_transformer(self, edge: Any) -> bool:
         if self._par_degree <= 1 or self._zero_stage < 3:
             return False
@@ -170,6 +484,35 @@ class PipelineGraphFlattener:
                     obj.duration,
                     fwd=obj.fwd,
                 )
+            elif "optimizer" in obj.name:
+                # Optimizer nodes need to be expanded per TP rank
+                cloned_nodes = []
+                for tp_rank in range(self._par_degree):
+                    hw_id = self._hw_id_for_rank(obj.hw_id, tp_rank)
+                    cloned_node = simulate_LLM.Node(
+                        name=f"{obj.name}_rank{tp_rank}",
+                        op_id=self._next_op_id(),
+                        hw_id=hw_id,
+                        duration=obj.duration,
+                        fwd=obj.fwd,
+                    )
+                    cloned_nodes.append(cloned_node)
+                
+                cloned_tuple = tuple(cloned_nodes)
+                self._clone_cache[obj_id] = cloned_tuple
+                
+                # We also need to copy metadata if any
+                for cloned_node in cloned_nodes:
+                    self._copy_metadata(obj, cloned_node)
+                    
+                # Attach children (if any) to all clones? 
+                # Let's follow the pattern:
+                for child in getattr(obj, "children", []):
+                    child_clone = self._clone(child)
+                    if child_clone is not None:
+                        self._attach(cloned_tuple, child_clone)
+                        
+                return cloned_tuple
             else:
                 cloned = simulate_LLM.Node(
                     obj.name,
@@ -178,6 +521,7 @@ class PipelineGraphFlattener:
                     obj.duration,
                     fwd=obj.fwd,
                 )
+
 
             # following _expand_transformer_node logic, we need to find siblings that are zero3 tp_shard=True.
             zero3_attachments: List[simulate_LLM.Edge] = []
@@ -239,6 +583,52 @@ class PipelineGraphFlattener:
             return cloned_batch
 
         raise TypeError(f"Unsupported graph element type: {type(obj)!r}")
+
+    def _propagate_local_hw_ids(self, roots: Any) -> None:
+        stack: List[Any] = []
+        if isinstance(roots, (list, tuple)):
+            stack.extend(list(roots))
+        elif roots is not None:
+            stack.append(roots)
+        visited: Set[int] = set()
+        while stack:
+            obj = stack.pop()
+            obj_id = id(obj)
+            if obj_id in visited:
+                continue
+            visited.add(obj_id)
+
+            children = getattr(obj, "children", [])
+            if isinstance(children, (list, tuple)):
+                stack.extend(children)
+            elif children is not None:
+                stack.append(children)
+
+            parents = getattr(obj, "parents", None)
+            if parents:
+                if isinstance(parents, (list, tuple)):
+                    stack.extend(parents)
+                else:
+                    stack.append(parents)
+
+            if isinstance(obj, simulate_LLM.Edge):
+                new_hw = None
+                for parent in getattr(obj, "parents", []) or []:
+                    parent_hw = getattr(parent, "hw_id", None)
+                    if parent_hw is None:
+                        parent_hw = getattr(parent, "local_hw_id", None)
+                    if parent_hw is not None and parent_hw >= 0:
+                        new_hw = parent_hw
+                        break
+                if new_hw is None:
+                    stage_id = getattr(obj, "stage_id", None)
+                    if stage_id is not None:
+                        try:
+                            new_hw = self._hw_id_for_rank(stage_id, 0)
+                        except Exception:
+                            new_hw = None
+                if new_hw is not None and new_hw >= 0:
+                    obj.local_hw_id = new_hw
 
 
     def _expand_transformer_node(self, node: simulate_LLM.Node) -> Tuple[Any, ...]:
@@ -421,6 +811,14 @@ class PipelineGraphFlattener:
             child_clone = self._clone(child)
             if child_clone is None:
                 continue
+            
+            # Special handling for optimizer nodes: 1-to-1 connection
+            if isinstance(child, simulate_LLM.Node) and "optimizer" in child.name and isinstance(child_clone, (list, tuple)):
+                if len(child_clone) == len(rank_tails):
+                    for r in range(len(rank_tails)):
+                        rank_tails[r].add_child(child_clone[r])
+                    continue
+            
             self._attach(downstream_parents, child_clone)
 
         for zero3_edge in zero3_attachments:
@@ -501,7 +899,33 @@ class PipelineGraphFlattener:
 
     def _hw_id_for_rank(self, stage_id: int, tp_rank: int) -> int:
         stage_int = int(stage_id) if stage_id is not None else 0
-        return stage_int * self._par_degree + tp_rank
+        tp_rank_int = int(tp_rank)
+        if tp_rank_int < 0 or tp_rank_int >= self._par_degree:
+            raise ValueError(f"tp_rank {tp_rank_int} is out of range for par_degree {self._par_degree}")
+        if not self._layout_axis_order:
+            return stage_int * self._par_degree + tp_rank_int
+
+        coords: Dict[str, int] = {}
+        if "tp" in self._layout_axis_order:
+            coords["tp"] = tp_rank_int % self._tp_size
+        if "cp" in self._layout_axis_order:
+            coords["cp"] = (tp_rank_int // self._tp_size) % self._cp_size
+        if "lp" in self._layout_axis_order:
+            if stage_int < 0 or stage_int >= self._lp_size:
+                raise ValueError(f"stage_id {stage_int} is out of range for lp={self._lp_size}")
+            coords["lp"] = stage_int % self._lp_size
+
+        linear_rank = 0
+        for axis in self._layout_axis_order:
+            coord = coords.get(axis, 0)
+            size = self._layout_axis_sizes.get(axis, 1)
+            if coord < 0 or coord >= size:
+                raise ValueError(f"Coordinate {coord} for axis '{axis}' is out of range <{size}")
+            stride = self._layout_axis_strides.get(axis)
+            if stride is None:
+                raise KeyError(f"Rank layout stride missing for axis '{axis}'")
+            linear_rank += coord * stride
+        return linear_rank
     
     
 class LLMExecutionDispatcher:
@@ -514,6 +938,7 @@ class LLMExecutionDispatcher:
         transformer_graph: Optional[Graph] = None,
         transformer_forward_root: Optional[Any] = None,
         transformer_backward_root: Optional[Any] = None,
+        no_data_parallel: bool = False,
     ) -> None:
         self.time_calc = time_calc
         self.pipeline_graph = pipeline_graph
@@ -523,6 +948,359 @@ class LLMExecutionDispatcher:
         self.transformer_forward_root = transformer_forward_root
         self.transformer_backward_root = transformer_backward_root
         self.flattened_root: Optional[Any] = None
+        self._transformer_rank_layout: Dict[str, Any] = {}
+        self._pipeline_rank_layout: Dict[str, Any] = {}
+        self._network_dimensions: Tuple[Any, ...] = tuple()
+        self._axis_dimension_map: Dict[str, int] = {}
+        self._transformer_stage_dp_faults: Dict[Tuple[int, int], Tuple[Tuple[int, int, float], ...]] = {}
+        self._transformer_stage_timings: Dict[Tuple[int, int], TransformerTimings] = {}
+        self._transformer_baseline_timings: Optional[TransformerTimings] = None
+        self.no_data_parallel = bool(no_data_parallel)
+        self._rank_layout = self._build_rank_layout_descriptor()
+        self._first_dim_optimize_cfg: Optional[Dict[str, Any]] = getattr(self, "_first_dim_optimize_cfg", None)
+        self._fault_space: Optional[FaultSpace] = None
+        self._fault_projections: Dict[str, FaultProjectionResult] = {}
+        self._initialize_fault_mappings()
+
+    def _build_rank_layout_descriptor(self) -> Dict[str, Any]:
+        hw_config = getattr(self.time_calc, "hw_config", None)
+        layout = getattr(hw_config, "network_layout", None)
+        dimensions = getattr(layout, "dimensions", None) if layout is not None else None
+        if not dimensions:
+            return {}
+        self._network_dimensions = tuple(dimensions)
+        optimize_cfg: Optional[Dict[str, Any]] = None
+        for idx, dim in enumerate(dimensions):
+            if getattr(dim, "optimize_2dmap", False):
+                if idx != 0:
+                    raise ValueError("optimize_2dmap is only supported on the first network dimension.")
+                if optimize_cfg is not None:
+                    raise ValueError("Multiple network dimensions requested optimize_2dmap; only one is supported.")
+                topo_type = getattr(dim, "topology_type", None)
+                if not topo_type:
+                    raise ValueError("optimize_2dmap requires a topology type on the target dimension.")
+                if str(topo_type).strip().lower() == "kingmesh2d":
+                    raise NotImplementedError("optimize_2dmap is not implemented for KingMesh2D.")
+                size_value = getattr(dim, "size", None)
+                if size_value is None:
+                    raise ValueError("optimize_2dmap requires an explicit dimension size.")
+                dims_value = getattr(dim, "size_2d", None)
+                if dims_value is not None:
+                    dims_value = (int(dims_value[0]), int(dims_value[1]))
+                optimize_cfg = {
+                    "dimension_index": idx,
+                    "topology": str(topo_type),
+                    "size": int(size_value),
+                    "parallelisms": tuple(getattr(dim, "parallelisms", ()) or ()),
+                }
+                if dims_value:
+                    optimize_cfg["dims"] = dims_value
+        self._first_dim_optimize_cfg = optimize_cfg
+
+        def _safe_int(value: Any, default: int = 1) -> int:
+            try:
+                candidate = int(value)
+            except (TypeError, ValueError):
+                candidate = default
+            return max(1, candidate)
+
+        tp_size = _safe_int(getattr(self.pipeline_graph, "tp", getattr(self.time_calc, "tp", 1)))
+        cp_size = _safe_int(getattr(self.pipeline_graph, "cp", getattr(self.time_calc, "cp", 1)))
+        lp_size = _safe_int(getattr(self.pipeline_graph, "lp", getattr(self.time_calc, "lp", 1)))
+        dp_size = _safe_int(getattr(self.time_calc, "dp", 1))
+
+        axis_sizes: Dict[str, int] = {"tp": tp_size, "cp": cp_size, "lp": lp_size, "dp": dp_size}
+        axis_order: List[str] = []
+
+        # Enforce axis ordering for hierarchical/hybrid modes: the first active
+        # dimension must contain exactly {'tp','cp'}. Subsequent active
+        # dimensions may contain 'lp' (optionally combined with 'dp'). This
+        # matches the assumptions in the hierarchical graphs where a stage is a
+        # TP/CP cluster replicated across LP (and potentially DP) axes.
+        enforce_layout = self.time_calc.execution_mode in {
+            ExecutionMode.HYBRID,
+            ExecutionMode.FULL_ASTRASIM_HIERARCHICAL,
+        }
+        first_active_checked = False
+
+        for dim in dimensions:
+            dim_axes = [str(axis).strip().lower() for axis in getattr(dim, "parallelisms", ())]
+            declared = int(getattr(dim, "size", 1))
+
+            axes_without_dp = [axis for axis in dim_axes if axis != "dp"]
+            if enforce_layout and declared > 1 and not first_active_checked and axes_without_dp:
+                canon = sorted(axes_without_dp)
+                if canon != ["cp", "tp"] and canon != ["tp", "cp"] and (axis_sizes["tp"] > 1 or axis_sizes["cp"] > 1):
+                    raise ValueError(
+                        "For hierarchical/hybrid AstraSim modes, the first active network "
+                        "dimension must contain exactly {'tp','cp'} to represent the tensor/context cluster."
+                    )
+                first_active_checked = True
+
+            for name in dim_axes:
+                if name not in axis_sizes:
+                    raise ValueError(
+                        f"Unsupported parallelism axis '{name}' in network layout. "
+                        "Supported axes for AstraSim integration are: tp, cp, lp, dp."
+                    )
+                if name not in axis_order:
+                    axis_order.append(name)
+
+            expected = 1
+            for axis_name in dim_axes:
+                expected *= axis_sizes.get(axis_name, 1)
+            if expected != declared:
+                raise ValueError(
+                    f"Network dimension '{getattr(dim, 'label', getattr(dim, 'id', '<unnamed>'))}' "
+                    f"size mismatch: declared {declared}, but parallelism factors imply {expected}."
+                )
+
+        # Ensure the layout covers active parallel axes
+        if tp_size > 1 and "tp" not in axis_order:
+            raise ValueError("Network layout must include 'tp' when tensor parallelism > 1.")
+        if cp_size > 1 and "cp" not in axis_order:
+            raise ValueError("Network layout must include 'cp' when context parallelism > 1.")
+        if lp_size > 1 and "lp" not in axis_order:
+            raise ValueError("Network layout must include 'lp' when pipeline parallelism > 1.")
+
+        axis_strides: Dict[str, int] = {}
+        span = 1
+        for axis in axis_order:
+            axis_strides[axis] = span
+            span *= axis_sizes[axis]
+
+        descriptor = {
+            "axis_order": axis_order,
+            "axis_sizes": axis_sizes,
+            "axis_strides": axis_strides,
+            "stage_span": span,
+        }
+
+        def _subset_layout(allowed: Sequence[str]) -> Optional[Dict[str, Any]]:
+            subset = [axis for axis in axis_order if axis in allowed and axis_sizes.get(axis, 1) >= 1]
+            if not subset:
+                return None
+            strides: Dict[str, int] = {}
+            span = 1
+            for axis in subset:
+                strides[axis] = span
+                span *= axis_sizes[axis]
+            return {
+                "axis_order": subset,
+                "axis_sizes": {axis: axis_sizes[axis] for axis in subset},
+                "axis_strides": strides,
+                "stage_span": span,
+            }
+
+        # Transformer graphs only encode TP/CP axes; pipeline graphs encode LP
+        # (DP replicas are handled externally). Store these subsets so callers
+        # can attach the appropriate layout before invoking AstraSim.
+        self._transformer_rank_layout = _subset_layout(["tp", "cp"])
+        self._pipeline_rank_layout = _subset_layout(["lp", "dp"])
+
+        return descriptor
+
+    def _attach_optimize_hint(self, root: Any) -> None:
+        if root is None:
+            return
+        if self._first_dim_optimize_cfg:
+            setattr(root, "_optimize_2dmap", dict(self._first_dim_optimize_cfg))
+        elif hasattr(root, "_optimize_2dmap"):
+            delattr(root, "_optimize_2dmap")
+
+    def _log_fault_summary(self, axis_order: Sequence[str], axis_sizes: Mapping[str, int]) -> None:
+        if not axis_order:
+            return
+        space = self._fault_space
+        if space is None or not space.entries:
+            return
+        network_dims = getattr(self, "_network_dimensions", tuple())
+        if not network_dims:
+            log_message("[DeepFlow][faults] Hardware dimensions unavailable; skipping fault summary.")
+            return
+
+        def coords_to_dict(coords: Tuple[Tuple[str, int], ...]) -> Dict[str, int]:
+            return {name: value for name, value in coords}
+
+        entries = space.entries
+        for dim_index, dim in enumerate(network_dims):
+            axes = [str(axis).strip().lower() for axis in getattr(dim, "parallelisms", ())]
+            if not axes:
+                continue
+            replication_axes: List[str] = []
+            for future_dim in network_dims[dim_index + 1 :]:
+                replication_axes.extend(
+                    str(axis).strip().lower() for axis in getattr(future_dim, "parallelisms", ()) if axis
+                )
+            total_clusters = 1
+            for axis in replication_axes:
+                total_clusters *= max(1, axis_sizes.get(axis, 1))
+            axes_label = ", ".join(axes) or "<none>"
+            table_rows: List[Tuple[str, str, float]] = []
+            for entry in entries:
+                if not any(axis in axes for axis in entry.affected_axes):
+                    continue
+                src_dict = coords_to_dict(entry.src_coords)
+                dst_dict = coords_to_dict(entry.dst_coords)
+                src_label = f"{entry.original[0]} (" + ", ".join(f"{axis}={src_dict.get(axis, 0)}" for axis in axes) + ")"
+                dst_label = f"{entry.original[1]} (" + ", ".join(f"{axis}={dst_dict.get(axis, 0)}" for axis in axes) + ")"
+                higher_coords = " ".join(f"{axis}={src_dict.get(axis, 0)}" for axis in replication_axes)
+                table_rows.append((higher_coords, f"{src_label} <-> {dst_label}", float(entry.original[2])))
+
+            if not table_rows:
+                log_message(f"  • dim{dim_index} ({axes_label}) → Affected HW clusters: 0 / {total_clusters}", category="faults")
+                continue
+
+            log_message(
+                f"  • dim{dim_index} ({axes_label}) → Affected HW clusters: {len(table_rows)} / {total_clusters or 1}",
+                category="faults",
+            )
+            header_axes = " ".join(replication_axes) if replication_axes else ""
+            log_message(f"  {header_axes:<12} | {'source ↔ dest':<40} | derate", category="faults")
+            log_message(f"  {'-' * max(len(header_axes),12)}-+-{'-' * 40}-+-------", category="faults")
+
+            for higher_str, pair, derate in table_rows:
+                log_message(
+                    f"  {higher_str:<12} | {pair:<40} | {derate:>6.2f}",
+                    category="faults",
+                )
+            log_message(f"  {'-' * max(len(header_axes),12)}-+-{'-' * 40}-+-------", category="faults")
+
+
+
+
+    def _initialize_fault_mappings(self) -> None:
+        hw_config = getattr(self.time_calc, "hw_config", None)
+        network_layout = getattr(hw_config, "network_layout", None)
+        faulty_links: Tuple[Tuple[int, int, float], ...] = tuple(
+            getattr(network_layout, "faulty_links", ()) or ()
+        )
+        if faulty_links and self.time_calc.execution_mode in {ExecutionMode.ANALYTICAL, ExecutionMode.HYBRID}:
+            raise ValueError("Faulty links require full AstraSim execution; analytical/hybrid modes are not supported.")
+        axis_layout = axis_layout_from_descriptor(self._rank_layout)
+        axis_dim_map = self._axis_to_dimension_map(network_layout)
+        self._axis_dimension_map = dict(axis_dim_map)
+        self._fault_space = FaultSpace(
+            axis_layout,
+            faulty_links,
+            axis_to_dimension=axis_dim_map,
+        )
+        self._fault_projections = self._build_fault_projections_from_space(self._fault_space)
+        self._validate_fault_coverage()
+        self._transformer_stage_dp_faults = self._build_transformer_stage_dp_fault_map()
+        axis_order = self._rank_layout.get("axis_order", []) if isinstance(self._rank_layout, dict) else []
+        axis_sizes = self._rank_layout.get("axis_sizes", {}) if isinstance(self._rank_layout, dict) else {}
+        self._log_fault_summary(axis_order, axis_sizes)
+
+    def _axis_to_dimension_map(self, network_layout) -> Dict[str, int]:
+        mapping: Dict[str, int] = {}
+        if network_layout is None:
+            return mapping
+        dimensions = getattr(network_layout, "dimensions", None)
+        if not dimensions:
+            return mapping
+        for idx, dim in enumerate(dimensions):
+            for axis in getattr(dim, "parallelisms", ()) or ():
+                normalized = str(axis).strip().lower()
+                if normalized:
+                    mapping[normalized] = idx
+        return mapping
+
+    def _build_fault_projections_from_space(
+        self,
+        space: FaultSpace,
+    ) -> Dict[str, FaultProjectionResult]:
+        projections: Dict[str, FaultProjectionResult] = {}
+        if not space.entries:
+            return projections
+
+        global_axes = tuple(space.layout.axis_order)
+        if global_axes:
+            projections["global"] = space.project(global_axes)
+
+        transformer_axes: Tuple[str, ...] = tuple(
+            self._transformer_rank_layout.get("axis_order", ())
+        ) if self._transformer_rank_layout else tuple()
+        if transformer_axes:
+            projections["transformer"] = space.project(transformer_axes)
+
+        pipeline_axes: Tuple[str, ...] = tuple(
+            self._pipeline_rank_layout.get("axis_order", ())
+        ) if self._pipeline_rank_layout else tuple()
+        if pipeline_axes:
+            projections["pipeline"] = space.project(pipeline_axes)
+
+        return projections
+
+    def _validate_fault_coverage(self) -> None:
+        if self._fault_space is None:
+            return
+        covered: Set[Tuple[int, int, float]] = set()
+        for label in ("transformer", "pipeline"):
+            proj = self._fault_projections.get(label)
+            if proj:
+                covered.update(proj.covered_originals)
+        uncovered = [
+            entry.original
+            for entry in self._fault_space.entries
+            if entry.original not in covered
+        ]
+        if uncovered:
+            formatted = ", ".join(str(item) for item in uncovered)
+            raise ValueError(
+                "Faulty links do not map to any transformer or pipeline axis subset: "
+                f"{formatted}"
+            )
+
+    def _axis_value_from_coords(self, coords: Tuple[Tuple[str, int], ...], axis: str) -> int:
+        for name, value in coords:
+            if name == axis:
+                return int(value)
+        layout = self._rank_layout or {}
+        if isinstance(layout, dict):
+            layout_axes = layout.get("axis_order", [])
+            if axis not in layout_axes:
+                return 0
+            axis_sizes = layout.get("axis_sizes", {})
+        else:
+            axis_sizes = {}
+        if axis_sizes.get(axis, 1) <= 1:
+            return 0
+        raise ValueError(f"Axis '{axis}' not present in coordinate tuple for faulty link.")
+
+    def _build_transformer_stage_dp_fault_map(self) -> Dict[Tuple[int, int], Tuple[Tuple[int, int, float], ...]]:
+        projection = self._fault_projection_for("transformer")
+        if not projection:
+            return {}
+        stage_dp_faults: Dict[Tuple[int, int], List[Tuple[int, int, float]]] = {}
+        for detail in projection.entries:
+            src_stage = self._axis_value_from_coords(detail.src_coords, "lp")
+            dst_stage = self._axis_value_from_coords(detail.dst_coords, "lp")
+            if src_stage != dst_stage:
+                raise ValueError(
+                    "Transformer faulty link spans multiple pipeline stages; "
+                    "hierarchical execution requires faults limited to a single stage."
+                )
+            src_dp = self._axis_value_from_coords(detail.src_coords, "dp")
+            dst_dp = self._axis_value_from_coords(detail.dst_coords, "dp")
+            affected_dp = {src_dp, dst_dp}
+            for dp_idx in affected_dp:
+                stage_dp_faults.setdefault((dp_idx, src_stage), []).append(detail.remapped)
+        return {key: tuple(links) for key, links in stage_dp_faults.items()}
+
+    def _fault_projection_for(self, label: str) -> Optional[FaultProjectionResult]:
+        return self._fault_projections.get(label)
+
+    def _fault_links_for(self, label: str) -> Tuple[Tuple[int, int, float], ...]:
+        projection = self._fault_projection_for(label)
+        if projection is None:
+            return tuple()
+        return projection.remapped_links
+
+    def _fault_override(self, label: str) -> Optional[Tuple[Tuple[int, int, float], ...]]:
+        if self._fault_space is None:
+            return None
+        return self._fault_links_for(label)
 
     def run(self, mode: ExecutionMode) -> ExecutionResult:
         if mode == ExecutionMode.ANALYTICAL:
@@ -533,19 +1311,24 @@ class LLMExecutionDispatcher:
             return self._run_full_astrasim_hierarchical()
         if mode == ExecutionMode.FULL_ASTRASIM_FLATTENED:
             return self._run_full_astrasim_flattened()
-        raise ValueError(f"Unsupported execution mode: {mode}")
 
     def _run_pipeline_with_analytical_comm(self, declared_mode: ExecutionMode) -> ExecutionResult:
         if declared_mode == ExecutionMode.HYBRID:
-            filename = "/hybrid_graph"
+            if self.no_data_parallel:
+                filename = "/hybrid_graph_no_dp"
+            else:
+                filename = "/hybrid_graph"
             timed_root = self.pipeline_root
         else: # must be "ANALYTICAL"
-            filename = "/analytical_graph"
-            timed_root = self.pipeline_graph.convert_comm_sizes_to_times(
-                self.pipeline_root,
-                self.time_calc.network_model,
-                self.interconnect_params,
-            )
+            if self.no_data_parallel:
+                filename = "/analytical_graph_no_dp"
+            else:
+                filename = "/analytical_graph"
+        timed_root = self.pipeline_graph.convert_comm_sizes_to_times(
+            self.pipeline_root,
+            self.time_calc.network_model,
+            self.interconnect_params,
+        )
             
         generate_graphs = _env_flag("DEEPFLOW_VISUALIZE_GRAPHS")
         if generate_graphs:
@@ -562,18 +1345,30 @@ class LLMExecutionDispatcher:
 
     def _run_hybrid(self) -> ExecutionResult:
         generate_graphs = _env_flag("DEEPFLOW_VISUALIZE_GRAPHS")
-        if generate_graphs:
-            self.transformer_graph.save_graph(
-                self.transformer_forward_root,
-                self.time_calc.output_dir,
-                "/hybrid_graph_transformer",
-            )
+
         transformer_time = self._run_transformer_astrasim(ExecutionMode.HYBRID)
+
+        
         if generate_graphs:
-            self.transformer_graph.save_graph(
+            transformer_timed_forward_root = self.transformer_graph.convert_comm_sizes_to_times(
                 self.transformer_forward_root,
+                self.time_calc.network_model,
+                self.interconnect_params,
+            )
+            transformer_timed_backward_root = self.transformer_graph.convert_comm_sizes_to_times(
+                self.transformer_backward_root,
+                self.time_calc.network_model,
+                self.interconnect_params,
+            )
+            self.transformer_graph.save_graph(
+                transformer_timed_forward_root,
                 self.time_calc.output_dir,
-                "/hybrid_graph_transformer",
+                "/hybrid_graph_transformer_forward",
+            )
+            self.transformer_graph.save_graph(
+                transformer_timed_backward_root,
+                self.time_calc.output_dir,
+                "/hybrid_graph_transformer_backward",
             )
 
         if transformer_time is not None:
@@ -585,6 +1380,28 @@ class LLMExecutionDispatcher:
         if transformer_time is not None:
             self._apply_transformer_time(transformer_time)
 
+        if _env_flag("DEEPFLOW_VISUALIZE_GRAPHS") and self.transformer_graph:
+            transformer_timed_forward_root = self.transformer_graph.convert_comm_sizes_to_times(
+                self.transformer_forward_root,
+                self.time_calc.network_model,
+                self.interconnect_params,
+            )
+            transformer_timed_backward_root = self.transformer_graph.convert_comm_sizes_to_times(
+                self.transformer_backward_root,
+                self.time_calc.network_model,
+                self.interconnect_params,
+            )
+            self.transformer_graph.save_graph(
+                transformer_timed_forward_root,
+                self.time_calc.output_dir,
+                "/hierarchical_graph_transformer_forward",
+            )
+            self.transformer_graph.save_graph(
+                transformer_timed_backward_root,
+                self.time_calc.output_dir,
+                "/hierarchical_graph_transformer_backward",
+            )
+
         dp_count = getattr(self.time_calc, "dp", 1) or 1
         if not self.pipeline_root:
             raise RuntimeError("Pipeline graph root is not available for AstraSim execution")
@@ -594,8 +1411,10 @@ class LLMExecutionDispatcher:
         if self.time_calc.persist_astrasim_artifacts:
             artifact_dir = os.path.join(self.time_calc.output_dir, "astra_hier")
 
+        pipeline_fault_override = self._fault_override("pipeline")
         run_kwargs = {
             "persist_artifacts": self.time_calc.persist_astrasim_artifacts,
+            "faulty_links_override": pipeline_fault_override,
         }
         run_type = str(getattr(getattr(self.time_calc, "model", None), "run_type", "training")).lower()
         effective_dp = 1 if run_type == "inference" else max(1, getattr(self.time_calc, "dp", 1))
@@ -603,12 +1422,19 @@ class LLMExecutionDispatcher:
             run_kwargs["dp_override"] = 1
 
         if _env_flag("DEEPFLOW_VISUALIZE_GRAPHS") and self.pipeline_root is not None:
+            filename = "/pipeline_graph_hierarchical_no_dp" if self.no_data_parallel else "/pipeline_graph_hierarchical"
             self.pipeline_graph.save_graph(
                 self.pipeline_root,
                 self.time_calc.output_dir,
-                "/pipeline_graph_hierarchical",
+                filename,
             )
 
+        pipeline_layout = getattr(self, "_pipeline_rank_layout", None)
+        if pipeline_layout:
+            setattr(self.pipeline_root, "_astrasim_rank_layout", pipeline_layout)
+        elif hasattr(self.pipeline_root, "_astrasim_rank_layout"):
+            delattr(self.pipeline_root, "_astrasim_rank_layout")
+        self._attach_optimize_hint(self.pipeline_root)
         per_rank_sec, max_sec = run_astra_simulation_only_onepath(
             self.pipeline_root,
             self.time_calc,
@@ -630,24 +1456,37 @@ class LLMExecutionDispatcher:
         flattener = PipelineGraphFlattener(
             pipeline_graph=self.pipeline_graph,
             transformer_graph=self.transformer_graph,
+            rank_layout=self._rank_layout,
         )
 
-        if _env_flag("DEEPFLOW_VISUALIZE_GRAPHS") and self.pipeline_root is not None:
+        if _env_flag("DEEPFLOW_VISUALIZE_GRAPHS") and self.pipeline_root is not None :
+            filename = "/pipeline_graph_pre_flatten_no_dp" if self.no_data_parallel else "/pipeline_graph_pre_flatten"
             self.pipeline_graph.save_graph(
                 self.pipeline_root,
                 self.time_calc.output_dir,
-                "/pipeline_graph_pre_flatten",
+                filename,
             )
         flattened_root = flattener.build(self.pipeline_root)
         if flattened_root is None:
             raise RuntimeError("Pipeline flattening produced an empty graph")
 
+        flattened_root = apply_overlap_transforms(
+            flattened_root,
+            self.time_calc.get_parallelism_mode(),
+            getattr(self.time_calc, "tp_overlap", 0.0),
+            getattr(self.time_calc, "tp_sp_overlap", 0.0),
+            getattr(self.time_calc, "cp_overlap", 0.0),
+        )
+        flattener._propagate_local_hw_ids(flattened_root)
+        setattr(flattened_root, "_astrasim_rank_layout", self._rank_layout)
+        self._attach_optimize_hint(flattened_root)
         self.time_calc.flattened_pipeline_root = flattened_root
         if _env_flag("DEEPFLOW_VISUALIZE_GRAPHS") and self.pipeline_root is not None:
+            filename = "/pipeline_graph_post_flatten_no_dp" if self.no_data_parallel else "/pipeline_graph_post_flatten"
             self.pipeline_graph.save_graph(
                 flattened_root,
                 self.time_calc.output_dir,
-                "/pipeline_graph_post_flatten",
+                filename,
             )
         self.pipeline_root = flattened_root
         # output_dir = "./astra_flattened_graph"
@@ -655,7 +1494,7 @@ class LLMExecutionDispatcher:
         # base_path = os.path.join(output_dir, "pipeline_flattened")
         # dot = visualize_graph(flattened_root, filename=base_path)
         # try:
-        #     dot.render(base_path, format="png", cleanup=True)
+        #     dot.render(base_path, format="svg", cleanup=True)
         # except Exception as exc:  # pragma: no cover - visualization best-effort
         #     print(f"[WARN] Failed to render flattened pipeline graph: {exc}")
 
@@ -687,6 +1526,7 @@ class LLMExecutionDispatcher:
             raise RuntimeError("AstraSim flattened execution returned no per-rank timings")
 
         expected_rank_count = effective_dp * len(unique_hw_ids)
+
         # Special case: If expected rank count is 1, then 2 is fine, but we prune the extra result
         # this is done, since astrasim backend only supports >1 ranks, so we generate extra fake result for that case.
         if expected_rank_count == 1:
@@ -696,7 +1536,6 @@ class LLMExecutionDispatcher:
                     f"expected {expected_rank_count}, got {len(per_rank_sec)}"
                 )
             per_rank_sec = per_rank_sec[:1]
-
         if len(per_rank_sec) != expected_rank_count:
             raise RuntimeError(
                 "AstraSim rank count mismatch for flattened execution: "
@@ -752,22 +1591,78 @@ class LLMExecutionDispatcher:
     def _run_transformer_astrasim(self, mode: ExecutionMode) -> Optional[TransformerTimings]:
         del mode  # mode currently unused but kept for signature consistency
 
-        # Use hierarchical artifact directory when persisting artifacts for transformer simulation
-        artifact_dir = self.time_calc.output_dir
-        artifact_dir_fwd = artifact_dir
-        artifact_dir_bwd = artifact_dir
-        os.makedirs(artifact_dir, exist_ok=True)
-        if self.time_calc.persist_astrasim_artifacts:
-            artifact_dir = os.path.join(self.time_calc.output_dir, "astra_hier")
-            artifact_dir_fwd = os.path.join(artifact_dir, "fwd")
-            artifact_dir_bwd = os.path.join(artifact_dir, "bwd")
-            os.makedirs(artifact_dir_fwd, exist_ok=True)
-            os.makedirs(artifact_dir_bwd, exist_ok=True)
+        if not self.transformer_forward_root and not self.transformer_backward_root:
+            if getattr(self, "_transformer_stage_dp_faults", {}):
+                raise ValueError("Transformer faults require transformer graph metadata, but none is available.")
+            return None
 
+        layout = getattr(self, "_transformer_rank_layout", {})
+        if self.transformer_forward_root:
+            setattr(self.transformer_forward_root, "_astrasim_rank_layout", layout)
+        if self.transformer_backward_root:
+            setattr(self.transformer_backward_root, "_astrasim_rank_layout", layout)
+
+        persist = self.time_calc.persist_astrasim_artifacts
+        os.makedirs(self.time_calc.output_dir, exist_ok=True)
+        self._transformer_stage_timings = {}
+        self._transformer_baseline_timings = None
+
+        # Baseline run (no transformer faults)
+        baseline_fwd_dir, baseline_bwd_dir = self._transformer_artifact_dirs(label=None, persist=persist)
+        baseline_timings, baseline_fwd_per_rank, baseline_bwd_per_rank = self._execute_transformer_run(
+            baseline_fwd_dir,
+            baseline_bwd_dir,
+            faulty_links_override=(),
+        )
+        self._transformer_baseline_timings = baseline_timings
+        self.time_calc.transformer_astrasim_per_rank_forward = baseline_fwd_per_rank
+        self.time_calc.transformer_astrasim_per_rank_backward = baseline_bwd_per_rank
+        self.time_calc.transformer_astrasim_time_forward = baseline_timings.forward
+        self.time_calc.transformer_astrasim_time_backward = baseline_timings.backward
+
+        # Per-stage fault runs
+        stage_dp_faults = getattr(self, "_transformer_stage_dp_faults", {})
+        for fault_index, ((dp_idx, stage_id), fault_links) in enumerate(sorted(stage_dp_faults.items())):
+            label = f"fault{fault_index}_dp{dp_idx}_stage{stage_id}"
+            stage_fwd_dir, stage_bwd_dir = self._transformer_artifact_dirs(label=label, persist=persist)
+            stage_timings, _, _ = self._execute_transformer_run(
+                stage_fwd_dir,
+                stage_bwd_dir,
+                faulty_links_override=fault_links,
+            )
+            self._transformer_stage_timings[(dp_idx, stage_id)] = stage_timings
+
+        return baseline_timings
+
+    def _transformer_artifact_dirs(self, label: Optional[str], persist: bool) -> Tuple[str, str]:
+        if not persist:
+            base_dir = self.time_calc.output_dir
+            os.makedirs(base_dir, exist_ok=True)
+            return base_dir, base_dir
+        base_dir = os.path.join(self.time_calc.output_dir, "astra_hier")
+        os.makedirs(base_dir, exist_ok=True)
+        if label is None:
+            fwd_dir = os.path.join(base_dir, "fwd")
+            bwd_dir = os.path.join(base_dir, "bwd")
+        else:
+            fwd_dir = os.path.join(base_dir, f"{label}_fwd")
+            bwd_dir = os.path.join(base_dir, f"{label}_bwd")
+        os.makedirs(fwd_dir, exist_ok=True)
+        os.makedirs(bwd_dir, exist_ok=True)
+        return fwd_dir, bwd_dir
+
+    def _execute_transformer_run(
+        self,
+        artifact_dir_fwd: str,
+        artifact_dir_bwd: str,
+        *,
+        faulty_links_override: Optional[Tuple[Tuple[int, int, float], ...]],
+    ) -> Tuple[TransformerTimings, Optional[List[float]], Optional[List[float]]]:
         fwd_per_rank = None
         bwd_per_rank = None
         fwd_max = 0
         bwd_max = 0
+
         if self.transformer_forward_root:
             fwd_per_rank, fwd_max = run_astra_simulation_only_onepath(
                 self.transformer_forward_root,
@@ -775,7 +1670,11 @@ class LLMExecutionDispatcher:
                 artifact_dir_fwd,
                 dp_override=1,
                 persist_artifacts=self.time_calc.persist_astrasim_artifacts,
+                faulty_links_override=faulty_links_override,
             )
+            if fwd_max <= 0:
+                raise RuntimeError("AstraSim transformer forward execution returned non-positive duration")
+
         if self.transformer_backward_root:
             bwd_per_rank, bwd_max = run_astra_simulation_only_onepath(
                 self.transformer_backward_root,
@@ -783,28 +1682,26 @@ class LLMExecutionDispatcher:
                 artifact_dir_bwd,
                 dp_override=1,
                 persist_artifacts=self.time_calc.persist_astrasim_artifacts,
+                faulty_links_override=faulty_links_override,
             )
+            if bwd_max < 0:
+                raise RuntimeError("AstraSim transformer backward execution returned non-positive duration")
 
-        self.time_calc.transformer_astrasim_per_rank_forward = fwd_per_rank
-        self.time_calc.transformer_astrasim_per_rank_backward = bwd_per_rank
-        self.time_calc.transformer_astrasim_time_forward = fwd_max
-        self.time_calc.transformer_astrasim_time_backward = bwd_max
-
-        if fwd_max < 0 or bwd_max < 0:
-            raise RuntimeError("AstraSim transformer execution returned non-positive duration")
-
-        return TransformerTimings(forward=fwd_max, backward=bwd_max)
+        return TransformerTimings(forward=fwd_max, backward=bwd_max), fwd_per_rank, bwd_per_rank
 
     def _apply_transformer_time(self, timings: TransformerTimings) -> None:
         if timings.forward < 0 or timings.backward < 0:
             raise ValueError("AstraSim transformer times must be positive")
 
+        baseline_timings = self._transformer_baseline_timings or timings
+        stage_timings = getattr(self, "_transformer_stage_timings", {})
+
         comp_times = getattr(self.pipeline_graph, "comp_times", None)
         if isinstance(comp_times, dict):
             if "transformer_f" in comp_times:
-                comp_times["transformer_f"] = timings.forward
+                comp_times["transformer_f"] = baseline_timings.forward
             if "transformer_b" in comp_times:
-                comp_times["transformer_b"] = timings.backward
+                comp_times["transformer_b"] = baseline_timings.backward
 
         visited: Set[int] = set()
         roots: List[Any]
@@ -813,10 +1710,27 @@ class LLMExecutionDispatcher:
         else:
             roots = [self.pipeline_root]
 
-        for root in roots:
-            self._assign_transformer_durations(root, visited, timings.forward, timings.backward)
+        dp_count = max(1, getattr(self.time_calc, "dp", 1))
 
-    def _assign_transformer_durations(self, node: Any, visited: Set[int], forward_value: float, backward_value: float) -> None:
+        for root in roots:
+            self._assign_transformer_durations(
+                root,
+                visited,
+                stage_timings,
+                baseline_timings.forward,
+                baseline_timings.backward,
+                dp_count,
+            )
+
+    def _assign_transformer_durations(
+        self,
+        node: Any,
+        visited: Set[int],
+        stage_timings: Dict[Tuple[int, int], TransformerTimings],
+        forward_default: float,
+        backward_default: float,
+        dp_count: int,
+    ) -> None:
         if node is None:
             return
         node_id = id(node)
@@ -827,10 +1741,31 @@ class LLMExecutionDispatcher:
         if isinstance(node, simulate_LLM.Node):
             base_name = str(getattr(node, "name", "") or "")
             if base_name.startswith("transformer_layer"):
+                hw_stage = None
+                try:
+                    hw_stage = int(getattr(node, "hw_id", None))
+                except (TypeError, ValueError):
+                    hw_stage = None
+                def _per_dp_durations(is_forward: bool) -> List[float]:
+                    values: List[float] = []
+                    for dp_idx in range(dp_count):
+                        timing_override = stage_timings.get((dp_idx, hw_stage)) if hw_stage is not None else None
+                        if timing_override:
+                            values.append(timing_override.forward if is_forward else timing_override.backward)
+                        else:
+                            default = forward_default if is_forward else backward_default
+                            values.append(default)
+                    return values
+
                 if getattr(node, "fwd", True):
-                    node.duration = forward_value
+                    per_dp_values = _per_dp_durations(is_forward=True)
                 else:
-                    node.duration = backward_value
+                    per_dp_values = _per_dp_durations(is_forward=False)
+
+                if dp_count > 1:
+                    node.duration = tuple(per_dp_values)
+                else:
+                    node.duration = per_dp_values[0]
 
         for child in getattr(node, "children", []):
-            self._assign_transformer_durations(child, visited, forward_value, backward_value)
+            self._assign_transformer_durations(child, visited, stage_timings, forward_default, backward_default, dp_count)

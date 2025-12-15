@@ -3,7 +3,8 @@ model_param:
     run_type: "training" # Type of run: "training" or "inference"
     tied_embeddings: false  # Share input and output embedding weights (WIP: affects memory estimation only)
     model_type: "gpt"  # gpt assumes dense-style architecture with GELU; llama assumes llama-style architecture with SwiGLU
-    batch_size: 1024  # Sequences per global batch
+    global_batch_size: 1024  # Sequences per global batch
+    gradient_accumulation_steps: 1  # Number of gradient accumulation micro-steps per optimizer update
     seq_len: 16384  # Sequence length (tokens per sequence)
     hidden_dim: 8192 # Transformer hidden dimension
     attention: # Attention-related parameters
@@ -16,4 +17,4 @@ model_param:
     top_k: 1   # Number of active experts per token in MoE
     intermediate_size: 32768 # Output dimension of the first FFN layer (typically 4×hidden_dim)
     vocab_size: 800000  # Vocabulary size
-    num_layers: 2 # Number of transformer layers
+    num_layers: 1 # Number of transformer layers

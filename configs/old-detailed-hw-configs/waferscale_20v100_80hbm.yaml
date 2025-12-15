@@ -111,7 +111,7 @@ tech_param:
       nominal_frequency: 12.48e9     # THIS IS BITS/SECOND PER LINK!!!! Look at lines 502 in hw_component.py, 678 in perf.py
       nominal_voltage: 1
           # energy per link 
-      nominal_energy_per_link: 8e-12     # This is probably pessimistic, as it is likely stated for 300mm. Our avg distance is 150mm. 8pj/Bit based on https://www.techpowerup.com/forums/threads/nvidia-is-preparing-co-packaged-photonics-for-nvlink.276139/#:~:text=While%20the%20current%20NVLink%202.0,(4%20pJ%2Fb), https://www.techpowerup.com/img/fpXXsSk543ZUFWcx_thm.jpg
+      energy_per_bit: 8e-12     # This is probably pessimistic, as it is likely stated for 300mm. Our avg distance is 150mm. 8pj/Bit based on https://www.techpowerup.com/forums/threads/nvidia-is-preparing-co-packaged-photonics-for-nvlink.276139/#:~:text=While%20the%20current%20NVLink%202.0,(4%20pJ%2Fb), https://www.techpowerup.com/img/fpXXsSk543ZUFWcx_thm.jpg
       nominal_area_per_link: 1e-12     #mm^2. We are setting this to an extremely low value on purpose to ignore mem ctrl area. This is basically 0 but we cant set to 0 because of div errors.
       num_links_per_mm: 3.363     #increased a tiny bit to account for integer division and the fact that I dropped digits
       threshold_voltage: 0.25
@@ -121,7 +121,7 @@ tech_param:
       latency: 5e-6
       nominal_frequency: 20e9
       nominal_voltage: 1.2
-      nominal_energy_per_link: 13e-12
+      energy_per_bit: 13e-12
       nominal_area_per_link: 0.045
       num_links_per_mm: 20     #Assuming 4 layers on PCB and 200 um pitch for high speed signalling
       threshold_voltage: 0.35
@@ -212,7 +212,7 @@ execution_backend:
   astra:
     backend: astra
     mode: hybrid  # hybrid | full_astrasim_hierarchical | full_astrasim_flattened
-    collectives:
+    collective_override:
       # Allowed values per op: auto | ring | direct | halvingDoubling | doubleBinaryTree
       # Note: leave to auto unless you have a specific reason to change it.
       all_gather: auto

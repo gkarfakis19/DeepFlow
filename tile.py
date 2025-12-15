@@ -31,7 +31,20 @@ hundreds of thousands of times. Key design choices for performance and determini
 from math import ceil
 from functools import lru_cache
 from enum import IntEnum
-from typing import Tuple, Union
+import math
+from typing import Tuple, Union, NamedTuple
+
+class AccessBytes(NamedTuple):
+    reads: tuple[int, ...]
+    writes: tuple[int, ...]
+    def totals(self) -> tuple[int, ...]:
+        return tuple(r + w for r, w in zip(self.reads, self.writes))
+
+def describe_accesses(profile: AccessBytes) -> str:
+    return ", ".join(
+        f"L{lvl}: R={formatBytes(r)} W={formatBytes(w)}"
+        for lvl, (r, w) in enumerate(zip(profile.reads, profile.writes))
+    )
 
 
 class Dataflow(IntEnum):
@@ -152,7 +165,7 @@ def generate_tile_space(memLayer, num_levels: int, dim1: int, dim2: int, dim3: i
 
     Largely unchanged from original function as it is not perf-critical.
     """
-    original = True
+    original = False
     tile_space = []
     tiles = [None] * num_levels
     for level in range(0, num_levels - 1):
@@ -214,18 +227,69 @@ def _sysarray_accesses_sig(M: int, N: int, K: int,
     return load_bytes + store_bytes
 
 
+def _l2_accesses_sig(M: int, N: int, K: int,
+                     l1_M: int, l1_K: int, l1_N: int,
+                     dtype_size: int) -> tuple[int, int]:
+    """Compute L2 memory accesses (reads, writes) in bytes."""
+    grid_x = -(-N // l1_N)
+    grid_y = -(-M // l1_M)
+
+    read_bytes = grid_x * (M * K * dtype_size) + grid_y * (K * N * dtype_size)
+    write_bytes = M * N * dtype_size
+    return (read_bytes, write_bytes)
+
+# Simplified approximate HBM model
+@lru_cache(maxsize=65536)
+def _hbm_accesses_sig_simplified(M: int, N: int, K: int,
+                                 l1_M: int, l1_K: int, l1_N: int,
+                                 dtype_size: int, total_bytes: int, l2_read: int,
+                                 capacity: int) -> tuple[int, int]:
+    """Compute HBM/DRAM memory accesses (reads, writes) in bytes.
+
+    Simplified reuse-distance model:
+    - Keep cold misses (first touches of A/B tiles).
+    - Approximate capacity pressure via a coarse working-set estimate per k-block.
+    - Avoid enumerating detailed reuse-distance patterns; replace with a ratio-based
+      penalty that scales cold misses when working set exceeds capacity.
+    """
+    tile_A = int(l1_M * l1_K)
+    tile_B = int(l1_K * l1_N)
+    tile_C = int(l1_M * l1_N)
+
+    capacity -= (108 * tile_C)
+
+    rows = -(-M // l1_M)
+    cols = -(-N // l1_N)
+    k_blocks = -(-K // l1_K)
+
+    total_accesses = rows * cols * k_blocks
+
+    cold_misses = rows * k_blocks * tile_A + cols * k_blocks * tile_B
+
+    working_set = rows * tile_A + cols * tile_B
+
+    if working_set > capacity:
+        excess_ratio = min(1.0, (working_set - capacity) / max(1, working_set))
+        capacity_misses = int(cold_misses * excess_ratio)
+    else:
+        capacity_misses = 0
+
+    total_misses = cold_misses + capacity_misses
+
+    write_bytes = M * N * dtype_size if total_bytes > capacity * dtype_size else 0
+
+    per_transfer_bytes = max(1, (tile_A + tile_B))
+    read_bytes = l2_read * total_misses / (total_accesses * per_transfer_bytes)
+
+    return (int(read_bytes), int(write_bytes))
+
 @lru_cache(maxsize=131072)
 def _simulate_accesses_sig(inner_code: int, M: int, K: int, N: int,
                            l2_M: int, l2_K: int, l2_N: int,
                            l1_M: int, l1_K: int, l1_N: int,
                            dtype_size: int, FMA_x: int, FMA_y: int, dataflow_code: Union[int, Dataflow],
                            capacity: int, total_bytes: int) -> Tuple[float, int, int, int]:
-    """Compute memory traffic at each level (sys, L1/shared, L2, DRAM).
-
-    Parameters are integers. The function is pure and amenable to
-    caching. It uses closed-form counts derived from tile reuse rather than
-    iterating through actual tiles, which keeps evaluation fast.
-    """
+    """Compute memory traffic at each level (sys, L1/shared, L2, DRAM)."""
     sys_bytes = _sysarray_accesses_sig(M, N, K, FMA_x, FMA_y, dataflow_code, dtype_size)
 
     num_tiles_M = -(-M // l2_M) # == math.ceil(M/l2_M)
@@ -240,58 +304,16 @@ def _simulate_accesses_sig(inner_code: int, M: int, K: int, N: int,
     write_bytes = (l1_M * l1_N * dtype_size) * (reuse_M * reuse_N)
     l1_shared_total = (read_bytes + write_bytes) * max_reload
 
-    # L2 accesses
-    # LOGIC BELOW THIS LINE CAN BE REWRITTEN IN A MORE EFFICIENT WAY
-    # IT HAS BEEN LEFT VERBOSE FOR READABILITY
-    factor_M = reuse_M
-    factor_K = reuse_K
-    factor_N = reuse_N
-    if inner_code == InnerLoop.M:
-        mk_load = max_reload
-        kn_load = num_tiles_K * num_tiles_N
-        mn_load = max_reload
-        factor_M = 1
-        dfk = Dataflow.WST
-    elif inner_code == InnerLoop.K:
-        mk_load = max_reload
-        kn_load = max_reload
-        mn_load = num_tiles_M * num_tiles_N
-        factor_K = 1
-        dfk = Dataflow.OST
-    elif inner_code == InnerLoop.N:
-        mk_load = num_tiles_M * num_tiles_K
-        kn_load = max_reload
-        mn_load = max_reload
-        factor_N = 1
-        dfk = Dataflow.AST
+    # L2 accesses (reads+writes lumped to match return contract)
+    l2_read, l2_write = _l2_accesses_sig(M, N, K, l1_M, l1_K, l1_N, dtype_size)
 
-    l2_bytes = (
-        mk_load * (l2_M * l2_K * dtype_size) * factor_N
-        + kn_load * (l2_K * l2_N * dtype_size) * factor_M
-        + 2 * mn_load * (l2_M * l2_N * dtype_size) * factor_K
+    # HBM/DRAM accesses via selected model (reads+writes lumped)
+    hbm_read, hbm_write = _hbm_accesses_sig_simplified(M, N, K, l1_M, l1_K, l1_N, dtype_size, total_bytes, l2_read, capacity)
+
+    return AccessBytes(
+        reads=(sys_bytes, read_bytes * max_reload, l2_read, hbm_read),
+        writes=(0, write_bytes * max_reload, l2_write, hbm_write)
     )
-
-    l2f0 = M // l2_M # are we sure these are floor and should not be ceil? (ceil is -(-M // l2_M))
-    l2f1 = K // l2_K
-    l2f2 = N // l2_N
-    reload_mk = 1
-    reload_kn = 1
-    reload_mn = 1
-    if dfk == Dataflow.WST:
-        reload_mk = l2f2
-        reload_mn = l2f1
-    elif dfk == Dataflow.OST:
-        reload_mk = l2f2
-        reload_kn = l2f0
-    elif dfk == Dataflow.AST:
-        reload_kn = l2f0
-        reload_mn = l2f1
-
-    dram_counts = reload_mk * (M * K * dtype_size) + reload_kn * (K * N * dtype_size)
-    if total_bytes > capacity:
-        dram_counts += reload_mn * (M * N * dtype_size)
-
-    return (sys_bytes, l1_shared_total, l2_bytes, dram_counts)
 
 
 
@@ -308,7 +330,7 @@ class TiledGEMM:
         self.memLayer = memLayer
         self.dtype_size = dtype_size
         self.M, self.K, self.N = tile_dims[3]
-        self.capacity = memLayer[3].size_per_bundle
+        self.capacity = memLayer[2].size_per_bundle # L2 capacity in bytes
         self.order_dims = order_dims if isinstance(order_dims, str) else None
         # Precompute inner code once (accepts str or int code)
         self._inner_code = (
@@ -361,6 +383,27 @@ class TiledGEMM:
     def GEMM_flop(self):
         """Theoretical FLOP count for the full GEMM of size MxKxN."""
         return self.M * self.N * (2 * self.K - 1)
+
+    @property
+    def bundle_util(self):
+        """Wave utilization of bundles"""
+        reuse_M = -(-self.M // self.l2_M)
+        reuse_K = -(-self.K // self.l2_K)
+        reuse_N = -(-self.N // self.l2_N)
+
+        gemm_waves = self.memLayer[1].calc_waves_per_sm(
+            self.M, self.K, self.N,
+            self.l2_M, self.l2_K, self.l2_N
+        )
+        
+        if gemm_waves == -1:
+            return 1.0
+        
+        full_waves = math.floor(gemm_waves)
+        partial_wave = gemm_waves - full_waves # fractional wave
+        
+        return (full_waves + partial_wave * partial_wave) / gemm_waves
+
 
     def sysarray_accesses(self):
         """Return systolic-array traffic (bytes) using cached pure function.

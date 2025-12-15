@@ -33,6 +33,7 @@ If uv is used, make sure to use `uv run` instead of `python` to execute python s
 - `git submodule update --remote -- astra-sim`
 - `ASTRA_SIM=$(realpath ./astra-sim)`
 - `cd ${ASTRA_SIM}`
+- `git submodule update --remote -- extern/network_backend/analytical`
 - `./build/astra_analytical/build.sh`
 - `cd ..`
 
@@ -173,7 +174,7 @@ python configs/model-config/hf_to_config.py Qwen/Qwen2.5-3B --run-type inference
 
 2. Open the provided A100 hardware file and set tensor parallel degree to 1:
 
-Edit `configs/hardware-config/a100_80GB.yaml` so that `system_hierarchy.num_devices_per_node: 1` and `scheduling_param.tp: 1`. This models one GPU without tensor parallelism.
+Edit `configs/hardware-config/a100_80GB.yaml` so that `parallelism.tp: 1`. This models one GPU without tensor parallelism.
 
 Run the inference estimation using the example configs:
 
@@ -183,7 +184,7 @@ python run_perf.py --hardware_config configs/hardware-config/a100_80GB.yaml --mo
 
 3. To see the effects of tensor-parallelism, modify the hardware file, switching to two devices per node, and tp = 2.
 
-Edit `configs/hardware-config/a100_80GB.yaml` so that `system_hierarchy.num_devices_per_node: 2` and `scheduling_param.tp: 2`. This models two GPU-inference with tensor parallelism degree of 2.
+Edit `configs/hardware-config/a100_80GB.yaml` so that `parallelism.tp: 2`. This models two GPU-inference with tensor parallelism degree of 2.
 
 Re-run the same inference command with the updated hardware config.
 
@@ -248,6 +249,10 @@ Comparing the two runs will show how increasing tensor parallelism changes the p
 ### Energy Estimation
 - **Supported:** Very rudimentary, non validated model. Does not consider static power. Inference only for now (Training is WIP). Energy due to prefill and decode is reported separately.
 - **Work in progress:** Training support, and heavy refinement of current implementation.
+
+### Mixed Precision
+- **Supported:** Mixed precision is supported for all supported parallelism and model types.
+- **Work in progress:** KV Cache precision cannot yet be set (config value is ignored).
 
 ### Validation
 - **Status:** Validation scripts are under development. Limited inference and training validation has been performed.

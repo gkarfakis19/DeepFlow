@@ -3,7 +3,8 @@ model_param:
   run_type: "training" # Type of run: "training" or "inference"
   tied_embeddings: true  # Share input and output embedding weights (WIP: affects memory estimation only)
   model_type: "llama"  # gpt assumes dense-style architecture with GELU; llama assumes llama-style architecture with SwiGLU
-  batch_size: 1024  # Sequences per global batch
+  global_batch_size: 1024  # Sequences per global batch
+  gradient_accumulation_steps: 1  # Number of gradient accumulation micro-steps per optimizer update
   seq_len: 2048  # Sequence length (tokens per sequence)
   hidden_dim: 4096 # Transformer hidden dimension
   attention: # Attention-related parameters

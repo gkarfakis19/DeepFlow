@@ -1,3 +1,6 @@
 [submodule "astra-sim"]
 	path = astra-sim
 	url = https://github.com/gkarfakis19/astra-sim
+[submodule "extern/graph_frontend/param"]
+	path = extern/graph_frontend/param
+	url = https://github.com/facebookresearch/param.git

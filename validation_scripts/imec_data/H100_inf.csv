@@ -1,0 +1,12 @@
+device,model,TP,actual
+H100,Llama 2-7B,1,1.44
+H100,Llama 2-7B,2,1.143
+H100,Llama 2-7B,4,0.924
+H100,Llama 2-7B,8,0.828
+H100,Llama 2-13B,1,2.396
+H100,Llama 2-13B,2,1.717
+H100,Llama 2-13B,4,1.431
+H100,Llama 2-13B,8,1.201
+H100,Llama 2-70B,2,6.267
+H100,Llama 2-70B,4,4.1226
+H100,Llama 2-70B,8,3.202

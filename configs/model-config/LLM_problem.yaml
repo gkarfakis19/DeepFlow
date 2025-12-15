@@ -1,0 +1,20 @@
+model_param:
+    mode: "LLM"  # Mode of operation
+    run_type: "training" # Type of run: "training" or "inference"
+    tied_embeddings: false  # Share input and output embedding weights (WIP: affects memory estimation only)
+    model_type: "gpt"  # gpt assumes dense-style architecture with GELU; llama assumes llama-style architecture with SwiGLU
+    global_batch_size: 1024  # Sequences per global batch
+    gradient_accumulation_steps: 1  # Number of gradient accumulation micro-steps per optimizer update
+    seq_len: 16384  # Sequence length (tokens per sequence)
+    hidden_dim: 8192 # Transformer hidden dimension
+    attention: # Attention-related parameters
+        attention_type: "mha"  # Supported attention types: "mha" or "gqa" ("mla" not implemented)
+        num_heads: 64 # Total number of attention heads
+        kv_heads: 8  # Number of key/value heads (used only when attention_type = "gqa")
+        use_flashattention: false  # Enable FlashAttention optimization
+        attention_tile_size: 256  # Tile size used in attention computation
+    num_experts: 1   # Number of experts in MoE layers. Set to 1 to disable MoE.
+    top_k: 1   # Number of active experts per token in MoE
+    intermediate_size: 32768 # Output dimension of the first FFN layer (typically 4×hidden_dim)
+    vocab_size: 800000  # Vocabulary size
+    num_layers: 3 # Number of transformer layers

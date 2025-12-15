@@ -1,8 +1,9 @@
 sw_param:
+  full_recomputation: true # Enable full activation recompute during backward instead of selective recomputation
   kernel_launch_overhead: 9e-6   # (s)
   # dp_zero_stage selects ZeRO-style data-parallel sharding: 0=DDP, 1=ZeRO-1, 2=ZeRO-2, 3=ZeRO-3
   # only used if data parallelism (dp) > 1
-  dp_zero_stage: 2
+  dp_zero_stage: 1
   precision:
     # tensor_format accepts numeric byte counts or dtype strings (fp16, bf16, fp32).
     # Take care that the number of flops defined below has been carefully tuned for FP16/BF16 formats.
@@ -13,7 +14,7 @@ sw_param:
     # -> false forces all activations/weights/gradients/optimizer states/stats to use tensor_format bytes.
     # -> true enables AMP-style FP32 accumulations/optimizer states depending on param_storage_mode.
     # if true, optimizer states and stats are always FP32.
-    mixed_precision: false
+    mixed_precision: true
     # param_storage_mode: as_tensor_format | tensor_plus_fp32_master | fp32_params.
     # -> as_tensor_format makes weights/gradients use tensor_format bytes.
     # -> tensor_plus_fp32_master makes weights/gradients use tensor_format bytes and
@@ -23,6 +24,8 @@ sw_param:
     # kv_cache precision may be set as bytes, dtype string, or "as_tensor_format".
     kv_cache: as_tensor_format
   h2d_bandwidth: -1  # Bytes/s; set -1 to disable H2D timing
+  # DP gradient sync frequency: every_mb (default) or last_mb (sync only on final microbatch; ZeRO-3 stays per-mb)
+  dp_microbatch: last_mb
 tech_param:
   core:
     operating_frequency: 1.41e9     # (Hz)
@@ -58,27 +61,7 @@ tech_param:
     dynamic_energy_per_bit: 110e-15 # (J)
     latency: 0
     util: 1
-  network:
-    intra_node:
-      latency: 5e-6
-      util: 1
-      bandwidth: 400 Gb
-    inter_node:
-      latency: 5e-6
-      util: 0.96
-      bandwidth: 400 Gb
-system_hierarchy:
-  num_devices_per_node: 8 # currently only support astrasim integration with all devices in one node.
-  num_nodes: 1
-  kp1_inter: false # these currently are not support for LLM mode.
-  kp2_inter: false
-  dp_inter: false
-  lp_inter: false
-  tp_inter: false
-network_topology:
-  # Allowed values: ring | fc | switch
-  inter_node: ring
-  intra_node: ring
+
 memory_hierarchy:
   l0:   #Register Memory
     type: SRAM-R
@@ -92,49 +75,77 @@ memory_hierarchy:
   l3:   #Global Memory
     type: DRAM
     scope: global
-scheduling_param:
-  auto: false # Not supported for LLM mode.
-  ### LLM PARAMS ###
+
+parallelism:
   dp: 2 # data parallelism. Acts as replica count during inference
-  lp: 2 # pipeline parallelism. Number of pipeline stages
-  mb: 1 # micro-batches (for best results set to >= lp)
   tp: 2 # tensor parallelism
   tp_sp: true # tensor-sequence parallelism
-  cp : 1 # context parallelism
-  ### LSTM/GEMM LEGACY PARAMS ###
-  t: "CR"
-  kp1: 1
-  kp2: 1
-  kp_hidden_dim1: 1
-  kp_hidden_dim2: 1
-  kp_softmax_dim1: 1
-  kp_softmax_dim2: 1
-  kp_embedding_dim1: 1
-  kp_embedding_dim2: 1
-  kp_projection_dim1: 1
-  kp_projection_dim2: 1
-  kp_hidden_type: -1
-  kp_softmax_type: -1
-  kp_embedding_type: -1
-  kp_projection_type: -1
+  cp: 2 # context parallelism. Not supported for inference.
+  lp: 4 # pipeline parallelism. Number of pipeline stages
+  # mb is not a true parallelism parameter, does not affect num of GPUs.
+  mb: 4 # micro-batches (for best results set to >= lp). 
 
+network:
+  overlap:
+    tp_overlap: 0.6
+    tp_sp_overlap: 0.63
+    cp_overlap: 1.0
+  # Global faulty links apply to the active AstraSim dimension: [[src, dst, weight]]
+  # faulty_links: [[0,1,0.6],[16,17,0.1]]
+  dimensions:
+    # currently only support astrasim integration with all devices in one node.
+    - id: dim0
+      label: torus2d_tp
+      size: auto
+      topology:
+        type: Ring
+        bandwidth: 100 GB # We assume 8 25GB/s NVLINKs in the torus. Torus2D is hardcoded bidirectional, so it's actually 4 links, 25GB/s each (because they get replicated). So 100GB/s total. 
+        latency: 5e-6
+        energy_per_bit: 8e-12 # (J/bit)
+        util: 1.0
+        optimize_2dmap: false
+      collective_override: {} # overrides execution_backend.collectives when provided
+      parallelisms: [tp, cp]
+    - id: dim1
+      label: inter_torus_infiniband
+      size: auto
+      topology:
+        type: Ring 
+        bandwidth: 25 GB
+        latency: 5e-6
+        energy_per_bit: 8e-12 # (J/bit)
+        util: 1.0
+      collective_override: {} # overrides execution_backend.collectives when provided
+      parallelisms: [lp,dp]
+    - id: dim2
+      label: inter_torus_infiniband_dp
+      size: auto
+      topology:
+        type: Ring
+        bandwidth: 25 GB
+        latency: 5e-6
+        energy_per_bit: 8e-12 # (J/bit)
+        util: 1.0
+      parallelisms: []
+      collective_override: {} # overrides execution_backend.collectives when provided
 
 execution_backend:
   model: astra # analytical | astra
   astra:
     backend: astra
-    mode: full_astrasim_flattened  # hybrid | full_astrasim_hierarchical | full_astrasim_flattened
+    mode: full_astrasim_hierarchica  # hybrid | full_astrasim_hierarchical | full_astrasim_flattened
     collectives:
-      # Allowed values per op: auto | ring | direct | halvingDoubling | doubleBinaryTree
+      # Default collective algorithms. Per-dimension collective_override entries can override these.
+      # Allowed values per op: auto | ring | direct | halvingDoubling | doubleBinaryTree | mesh | mesh2d | hypercube | torus2d
       # Note: leave to auto unless you have a specific reason to change it.
       all_gather: auto
       all_reduce: auto
       reduce_scatter: auto
       all_to_all: auto
     sys_options:
-      endpoint_delay: 10
+      endpoint_delay: 5
       active_chunks_per_dimension: 32 # Higher value means significantly slower astrasim runtime, but more accurate especially for tensor parallelism
-      preferred_dataset_splits: 32 # Should be same as active_chunks_per_dimension
+      preferred_dataset_splits: 4 # Should be same as active_chunks_per_dimension
 
 inference:
   kvcache_type: hbm_only # Only supported mode for now.
