@@ -31,8 +31,8 @@ os.environ["DEEPFLOW_ASTRA_CACHE_MODE"] = _CACHE_MODE_MAP.get(
     cache_handling.strip().upper(), "CACHE_READWRITE"
 )
 
-# Default location for artifacts emitted by run_perf.
-DEFAULT_OUTPUT_DIR = "output"
+# Default location for artifacts emitted by run_perf. Allow override for per-run isolation.
+DEFAULT_OUTPUT_DIR = os.environ.get("DEEPFLOW_OUTPUT_DIR", "output")
 
 # Global wall-clock timer: report total program runtime at exit
 _program_start_time = time.perf_counter()

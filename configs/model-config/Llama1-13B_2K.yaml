@@ -1,0 +1,22 @@
+model_param:
+  mode: "LLM"
+  run_type: "training"
+  tied_embeddings: true
+  model_type: "llama"
+  # Global batch size from Table 1 (2k seq -> GBS=2048)
+  batch_size: 2048
+  seq_len: 2048
+  decode_len: 0
+  hidden_dim: 5120
+  attention:
+    attention_type: "mha"
+    num_heads: 40
+  ffn_dim: 13824
+  ffn_mult: null
+  vocab_size: 128000
+  num_layers: 40
+  n_tokens: null
+  all_reduce: "every layer"
+inference_param:
+  sample_every: -1
+# No GQA; KV heads = 32. FlashDecoding++ BS=1, input=32K reference.

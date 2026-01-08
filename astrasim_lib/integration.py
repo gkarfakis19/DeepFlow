@@ -257,6 +257,10 @@ def generate_concurrent_collectives_et(
 def _astrasim_binary_path() -> str:
     """Return the default AstraSim analytical binary path relative to the repo root."""
 
+    override = os.environ.get("DEEPFLOW_ASTRASIM_BINARY") or os.environ.get("ASTRASIM_ANALYTICAL_BINARY")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+
     return os.path.join(
         os.path.dirname(__file__),
         "..",
@@ -335,8 +339,13 @@ def run_cache_astrasim(
     axes_filter: Optional[Sequence[str]] = None,
     transform_2d_to_1d: bool = False,
     files = None,
+    binary_path: Optional[str] = None,
 ) -> Tuple[List[float], float]:
-    """Run AstraSim with caching to avoid recomputation when inputs match."""
+    """Run AstraSim with caching to avoid recomputation when inputs match.
+
+    The AstraSim analytical binary can be overridden via ``binary_path`` (or the
+    ``DEEPFLOW_ASTRASIM_BINARY``/``ASTRASIM_ANALYTICAL_BINARY`` environment variables).
+    """
 
     if isinstance(hw_obj, str):
         raise TypeError("run_cache_astrasim expects a parsed HWConfig object, not a path")
@@ -379,6 +388,8 @@ def run_cache_astrasim(
             and comm_lower != "graph"
             and cache_dir_abs == _DEFAULT_ASTRA_CACHE_DIR
         )
+        bin_override = os.fspath(binary_path) if binary_path is not None else None
+        bin_path = os.path.abspath(os.path.expanduser(bin_override)) if bin_override else _astrasim_binary_path()
 
         sig: Dict[str, Any] = {
             "comm": comm_lower,
@@ -390,6 +401,7 @@ def run_cache_astrasim(
             "ll_ns": ll_ns,
             "collectives": colls,
             "backend": "analytical",
+            "binary": bin_path,
         }
         if sys_opts_sig is not None:
             sig["sys_options"] = sys_opts_sig
@@ -478,7 +490,6 @@ def run_cache_astrasim(
         last_outcome_zero = False
 
         # Capture command details for debugging
-        bin_path = _astrasim_binary_path()
         debug_cmd = [
             bin_path,
             f"--workload-configuration={workload_prefix}",
@@ -500,6 +511,7 @@ def run_cache_astrasim(
                 network_yaml=files["network_yaml"],
                 remote_memory_json=remote_mem_path,
                 comm_group_json=comm_group_json,
+                binary_path=bin_path,
             )
             if per_node_sec and max_sec > 0 and len(per_node_sec) == int(npus_count) and all((t > 0 for t in per_node_sec)):
                 last_outcome_zero = False
@@ -520,6 +532,7 @@ def run_cache_astrasim(
             "workload_prefix": workload_prefix,
             "system_json": files["system_json"],
             "network_yaml": files["network_yaml"],
+            "binary_path": bin_path,
         }
         if manifest_json_path:
             cache_entry["manifest_path"] = manifest_json_path

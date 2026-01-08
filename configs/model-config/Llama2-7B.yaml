@@ -5,12 +5,12 @@ model_param:
   model_type: "llama"  # gpt assumes dense-style architecture with GELU; llama assumes llama-style architecture with SwiGLU
   global_batch_size: 1024  # Sequences per global batch
   gradient_accumulation_steps: 1  # Number of gradient accumulation micro-steps per optimizer update
-  seq_len: 2048  # Sequence length (tokens per sequence)
+  seq_len: 4096  # Sequence length (tokens per sequence)
   hidden_dim: 4096 # Transformer hidden dimension
   attention: # Attention-related parameters
     attention_type: "mha"  # Supported attention types: "mha" or "gqa" ("mla" not implemented)
     num_heads: 32 # Total number of attention heads
-    kv_heads: null  # Number of key/value heads (used only when attention_type = "gqa")
+    kv_heads: 32  # Number of key/value heads (used only when attention_type = "gqa")
     use_flashattention: false  # Enable FlashAttention optimization
     attention_tile_size: null  # Tile size used in attention computation
   num_experts: 1   # Number of experts in MoE layers. Set to 1 to disable MoE.

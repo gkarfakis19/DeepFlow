@@ -1,5 +1,5 @@
 sw_param:
-  full_recomputation: true # Enable full activation recompute during backward instead of selective recomputation
+  full_recomputation: false # Enable full activation recompute during backward instead of selective recomputation
   kernel_launch_overhead: 9e-6   # (s)
   # dp_zero_stage selects ZeRO-style data-parallel sharding: 0=DDP, 1=ZeRO-1, 2=ZeRO-2, 3=ZeRO-3
   # only used if data parallelism (dp) > 1
@@ -77,13 +77,13 @@ memory_hierarchy:
     scope: global
 
 parallelism:
-  dp: 2 # data parallelism. Acts as replica count during inference
-  tp: 2 # tensor parallelism
-  tp_sp: true # tensor-sequence parallelism
-  cp: 2 # context parallelism. Not supported for inference.
-  lp: 4 # pipeline parallelism. Number of pipeline stages
+  dp: 8 # data parallelism. Acts as replica count during inference
+  tp: 1 # tensor parallelism
+  tp_sp: false # tensor-sequence parallelism
+  cp: 1 # context parallelism. Not supported for inference.
+  lp: 1 # pipeline parallelism. Number of pipeline stages
   # mb is not a true parallelism parameter, does not affect num of GPUs.
-  mb: 4 # micro-batches (for best results set to >= lp). 
+  mb: 1 # micro-batches (for best results set to >= lp). 
 
 network:
   overlap:
@@ -133,7 +133,7 @@ execution_backend:
   model: astra # analytical | astra
   astra:
     backend: astra
-    mode: full_astrasim_hierarchica  # hybrid | full_astrasim_hierarchical | full_astrasim_flattened
+    mode: full_astrasim_flattened  # hybrid | full_astrasim_hierarchical | full_astrasim_flattened
     collectives:
       # Default collective algorithms. Per-dimension collective_override entries can override these.
       # Allowed values per op: auto | ring | direct | halvingDoubling | doubleBinaryTree | mesh | mesh2d | hypercube | torus2d
@@ -143,9 +143,9 @@ execution_backend:
       reduce_scatter: auto
       all_to_all: auto
     sys_options:
-      endpoint_delay: 5
+      endpoint_delay: 10
       active_chunks_per_dimension: 32 # Higher value means significantly slower astrasim runtime, but more accurate especially for tensor parallelism
-      preferred_dataset_splits: 4 # Should be same as active_chunks_per_dimension
+      preferred_dataset_splits: 32 # Should be same as active_chunks_per_dimension
 
 inference:
   kvcache_type: hbm_only # Only supported mode for now.

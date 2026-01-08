@@ -233,15 +233,19 @@ def build_specs_for_device(
   *,
   models: Optional[Iterable[str]] = None,
   tp_sp_only: Optional[bool] = None,
+  exclude_models: Optional[Iterable[str]] = None,
 ) -> Tuple[List[ValidationSpec], Dict[Tuple[str, int, int, int, int, int, int, bool, str], float], str, str]:
   data = _load_device_data(device)
   model_filter = set(models) if models is not None else None
+  exclude_set = set(exclude_models) if exclude_models is not None else None
   specs: List[ValidationSpec] = []
   actual_lookup: Dict[Tuple[str, int, int, int, int, int, int, bool, str], float] = {}
   base_model_path: Optional[str] = None
   hw_config_path: Optional[str] = None
   idx = 0
   for device_val, model, batch, mb, dp, tp, pp, cp, tp_sp, recomputation in _iter_tests(data):
+    if exclude_set and model in exclude_set:
+      continue
     if model_filter and model not in model_filter:
       continue
     if tp_sp_only is not None and bool(tp_sp) != bool(tp_sp_only):

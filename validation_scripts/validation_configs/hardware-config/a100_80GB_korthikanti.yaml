@@ -110,7 +110,7 @@ network:
       label: inter_torus_infiniband
       size: auto
       topology:
-        type: FullyConnected 
+        type: Ring 
         bandwidth: 25 GB # 25GB/s per GPU, N GPUs per node. NOT AGGREGATE.
         latency: 5e-6 
         energy_per_bit: 8e-12 # (J/bit)
